@@ -1,0 +1,16 @@
+# Jungle walk for perf/speed tests: Continue from the "Jungle crash site" save (its opening plane
+# cutscene plays out, gameplay from ~175 s), then walk/turn on fixed timings. Measure 185-218 s
+# with tools/perf_window.py. Needs a user folder with that save (H:/LostRecomp-heavy/user-savetest).
+8.0  START
+12.0 START
+16.0 START
+22.0 START
+27.0 LEFT
+29.0 A
+32.0 A
+35.0 A
+178.0 A
+182.0 A
+190.0 stick 0 1 0 0 hold 8
+200.0 stick 0 0 0.6 0 hold 3
+205.0 stick 0 1 0 0 hold 10

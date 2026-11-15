@@ -1,0 +1,133 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 0e9e180d..b07bec24 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -472,6 +472,11 @@ class D3D12CommandProcessor : public CommandProcessor {
+   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
+   DeferredCommandList deferred_command_list_;
+ 
++  // lost-recomp: the index buffer view last set in the current command list
++  // (d3d12_index_buffer_whole_shared_memory), invalid at the start of a submission.
++  D3D12_INDEX_BUFFER_VIEW current_index_buffer_view_ = {};
++  bool current_index_buffer_view_valid_ = false;
++
+   // lost-recomp: async submission (d3d12_async_submission). Replaying a deferred list into the
+   // driver is about a third of the command processor thread's time, so finished submissions are
+   // replayed and executed by a worker thread, in order, while the command processor goes on.
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 73ece755..5b6382bb 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -33,6 +33,12 @@
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_skip_redundant_constant_writes, true, "GPU",
++                    "Ignore float/bool/loop shader constant writes that don't change the value, so "
++                    "unchanged constants aren't uploaded and rebound again (lost-recomp)");
++REXCVAR_DEFINE_BOOL(d3d12_index_buffer_whole_shared_memory, true, "GPU",
++                    "Index guest index buffers through one view of all of shared memory and a "
++                    "start index, instead of a new index buffer view per draw (lost-recomp)");
+ REXCVAR_DEFINE_BOOL(d3d12_async_submission, true, "GPU",
+                     "Replay and submit finished command lists on a worker thread (lost-recomp)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -1810,6 +1816,13 @@ void D3D12CommandProcessor::ShutdownContext() {
+ }
+ 
+ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
++  // Pure shader state: rewriting the same value changes nothing (lost-recomp).
++  if (((index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
++       (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
++        index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) &&
++      register_file_->values[index] == value && REXCVAR_GET(gpu_skip_redundant_constant_writes)) {
++    return;
++  }
+   CommandProcessor::WriteRegister(index, value);
+ 
+   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+@@ -1875,8 +1888,19 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
+     return (usage_map[last_word] & last_mask) != 0;
+   };
+ 
++  // lost-recomp: a range that leaves every value as it was changes nothing.
++  auto unchanged = [this, start_index, base, num_registers] {
++    if (!REXCVAR_GET(gpu_skip_redundant_constant_writes)) return false;
++    const uint32_t* current = register_file_->values + start_index;
++    for (uint32_t i = 0; i < num_registers; ++i) {
++      if (current[i] != memory::load_and_swap<uint32_t>(base + i)) return false;
++    }
++    return true;
++  };
++
+   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
++    if (unchanged()) return;
+     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+     if (frame_open_) {
+       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+@@ -1903,6 +1927,7 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
+ 
+   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
++    if (unchanged()) return;
+     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+     cbuffer_binding_bool_loop_.up_to_date = false;
+     return;
+@@ -2724,6 +2749,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       index_buffer_view.Format = DXGI_FORMAT_R32_UINT;
+     }
+     ID3D12Resource* scratch_index_buffer = nullptr;
++    uint32_t start_index_location = 0;
+     switch (primitive_processing_result.index_buffer_type) {
+       case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA: {
+         if (memexport_used) {
+@@ -2746,6 +2772,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+         } else {
+           index_buffer_view.BufferLocation =
+               shared_memory_->GetGPUAddress() + primitive_processing_result.guest_index_base;
++          // lost-recomp: one view of all of shared memory and a start index, so consecutive
++          // draws don't each need a new index buffer view.
++          const uint32_t index_size =
++              index_buffer_view.Format == DXGI_FORMAT_R16_UINT ? 2u : 4u;
++          if (REXCVAR_GET(d3d12_index_buffer_whole_shared_memory) &&
++              primitive_processing_result.guest_index_base % index_size == 0) {
++            index_buffer_view.BufferLocation = shared_memory_->GetGPUAddress();
++            index_buffer_view.SizeInBytes = SharedMemory::kBufferSize;
++            start_index_location = primitive_processing_result.guest_index_base / index_size;
++          }
+         }
+       } break;
+       case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
+@@ -2761,7 +2797,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+         assert_unhandled_case(primitive_processing_result.index_buffer_type);
+         return false;
+     }
+-    deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
++    if (!current_index_buffer_view_valid_ ||
++        current_index_buffer_view_.BufferLocation != index_buffer_view.BufferLocation ||
++        current_index_buffer_view_.SizeInBytes != index_buffer_view.SizeInBytes ||
++        current_index_buffer_view_.Format != index_buffer_view.Format) {
++      deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
++      current_index_buffer_view_ = index_buffer_view;
++      current_index_buffer_view_valid_ = true;
++    }
+     if (memexport_used) {
+       shared_memory_->UseForWriting();
+     } else {
+@@ -2771,7 +2814,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+     deferred_command_list_.D3DDrawIndexedInstanced(
+-        primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
++        primitive_processing_result.host_draw_vertex_count, 1, start_index_location, 0, 0);
+     if (scratch_index_buffer != nullptr) {
+       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+     }
+@@ -3387,6 +3430,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     deferred_command_list_.Reset();
+ 
+     // Reset cached state of the command list.
++    current_index_buffer_view_valid_ = false;
+     ff_viewport_update_needed_ = true;
+     ff_scissor_update_needed_ = true;
+     ff_blend_factor_update_needed_ = true;

@@ -1,0 +1,31 @@
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e9..cdee6cc1 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -40,6 +40,14 @@ REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU"
+ //     "is necessary for certain games to display the scene graphics).",
+ //     "GPU");
+ 
++// lost-recomp: Lost: Via Domus's Bink movie quad (RAD BinkTextures.cpp, DrawPrimitiveUP) arrives
++// with SQ_PROGRAM_CNTL.vs_export_mode = 7 (multipass), which this treated as "kill all
++// primitives", so every video frame was dropped and the screen stayed black. The movies play
++// on a real console, so draw such primitives (the translator ignores the export mode).
++REXCVAR_DEFINE_BOOL(gpu_rasterize_multipass, true, "GPU",
++                    "Rasterize draws whose vertex shader export mode is multipass instead of "
++                    "dropping them (needed for Lost: Via Domus's Bink videos)");
++
+ namespace rex::graphics::draw_util {
+ 
+ bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_polygonal) {
+@@ -50,8 +58,9 @@ bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_pol
+   if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
+     return false;
+   }
+-  if (regs.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode ==
+-          xenos::VertexShaderExportMode::kMultipass ||
++  if ((!REXCVAR_GET(gpu_rasterize_multipass) &&
++       regs.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode ==
++           xenos::VertexShaderExportMode::kMultipass) ||
+       !regs.Get<reg::RB_SURFACE_INFO>().surface_pitch) {
+     return false;
+   }

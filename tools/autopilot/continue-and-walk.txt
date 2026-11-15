@@ -1,0 +1,24 @@
+# From start-up into gameplay from the last save, then move around (perf / stutter tests).
+#   powershell -File tools/smoke.ps1 -Seconds 150 -NotHeadless -UserDir <copy of a user folder with a save>
+#     -Extra '--lost_autopilot=<repo>\tools\autopilot\continue-and-walk.txt'
+# Times are seconds from start-up. Logos and intro run to ~20 s; START skips to "Press START".
+8.0  START
+12.0 START
+16.0 START
+22.0 START       # Press START -> main menu
+25.0 LEFT        # New Game is highlighted; Continue is the tile to its left
+26.0 A           # Continue
+29.0 A           # confirm / device selector
+32.0 A
+# Loading screen (~15-25 s), then the checkpoint. A few A presses skip any intro text.
+55.0 A
+60.0 A
+# Walk forward, look around, walk again, turn: streams new areas in.
+70.0  stick 0 1 0 0 hold 6
+77.0  stick 0 0 0.7 0 hold 2
+80.0  stick 0 1 0 0 hold 6
+87.0  stick 0 0 -0.7 0 hold 3
+91.0  stick 0 1 0 0 hold 8
+100.0 stick 0.6 0.8 0 0 hold 8
+110.0 stick 0 1 0.3 0 hold 10
+122.0 stick -0.6 0.8 0 0 hold 8

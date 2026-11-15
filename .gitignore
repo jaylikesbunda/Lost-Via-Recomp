@@ -1,0 +1,36 @@
+# Game material and derived data - never commit
+private/
+port/assets/
+port/generated/*/
+!port/generated/rexglue.cmake
+*.iso
+*.xex
+*.xexp
+*.bin
+*.big
+*.bik
+*.bao
+tools/xex_key.txt
+
+# Toolchain, SDK, builds (junctions to H:)
+.tools/
+third_party/
+out/
+port/out/
+build/
+
+# Reference checkouts
+reference/
+
+# Local state
+logs/
+*.log
+*.sav
+*.dmp
+__pycache__/
+
+# Private development notes and scratch files
+/docs/
+/CLAUDE.md
+/PLAN.md
+/f_*.txt

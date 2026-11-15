@@ -1,0 +1,52 @@
+diff --git a/src/graphics/d3d12/deferred_command_list.cpp b/src/graphics/d3d12/deferred_command_list.cpp
+index e6d6277c..9c8f9dff 100644
+--- a/src/graphics/d3d12/deferred_command_list.cpp
++++ b/src/graphics/d3d12/deferred_command_list.cpp
+@@ -15,6 +15,14 @@
+ #include <rex/graphics/d3d12/deferred_command_list.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/math.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++#include <chrono>
++#include <string>
++
++REXCVAR_DEFINE_BOOL(gpu_log_d3d_command_counts, false, "GPU",
++                    "Every 5 s, log how many of each D3D12 command were replayed (diagnostics)");
+ 
+ namespace rex::graphics::d3d12 {
+ 
+@@ -33,6 +41,24 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  static uint64_t command_counts[64] = {};
++  static uint64_t executes = 0;
++  static auto last_log = std::chrono::steady_clock::now();
++  const bool count_commands = REXCVAR_GET(gpu_log_d3d_command_counts);
++  if (count_commands) {
++    ++executes;
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last_log >= std::chrono::seconds(5)) {
++      last_log = now;
++      std::string line;
++      for (size_t i = 0; i < 64; ++i) {
++        if (command_counts[i]) line += " " + std::to_string(i) + ":" + std::to_string(command_counts[i]);
++        command_counts[i] = 0;
++      }
++      REXGPU_INFO("D3D12 commands 5s ({} lists):{}", executes, line);
++      executes = 0;
++    }
++  }
+   const uintmax_t* stream = command_stream_.data();
+   size_t stream_remaining = command_stream_.size();
+   ID3D12PipelineState* current_pipeline_state = nullptr;
+@@ -40,6 +66,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+     stream_remaining -= kCommandHeaderSizeElements;
++    if (count_commands) ++command_counts[size_t(header.command)];
+     switch (header.command) {
+       case Command::kD3DClearDepthStencilView: {
+         auto& args = *reinterpret_cast<const ClearDepthStencilViewHeader*>(stream);

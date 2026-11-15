@@ -1,0 +1,49 @@
+// Lost native renderer (ported from pgr4-native 8ea20d5, MIT; see native/README.md): the CPU clock.
+//
+// Ticks() reads the time-stamp counter, which runs at a constant rate on every CPU the build
+// targets and costs a few ns, where QueryPerformanceCounter under Wine is a syscall (about
+// 0.15 µs). NowNs() is the same clock in nanoseconds, calibrated against QueryPerformanceCounter
+// (CLOCK_MONOTONIC elsewhere) over 20 ms at its first use. Hot paths sum ticks and convert the sum once (TicksToNs).
+#pragma once
+
+#include <cstdint>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#if defined(_WIN32)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#endif
+
+namespace lost::native {
+
+inline uint64_t Ticks() {
+#if defined(_M_X64) || defined(__x86_64__)
+  return __rdtsc();
+#elif defined(__aarch64__)
+  uint64_t t;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(t));
+  return t;
+#else
+#error "Ticks: no cycle counter for this architecture"
+#endif
+}
+
+// Monotonic, in nanoseconds.
+uint64_t NowNs();
+// A tick count (a difference of Ticks()) in nanoseconds.
+uint64_t TicksToNs(uint64_t ticks);
+
+// The calling thread's use of the CPU so far, for the frame CSV: a syscall or three, so once per
+// frame at most. Linux only: runq_ns, the time it was ready to run but had no CPU (0 where the
+// kernel doesn't report it), blocks, how often it gave up the CPU to wait, and preempts, how often
+// it was taken off it. process_cpu_ns: all of the process's threads together.
+struct ThreadUsage {
+  uint64_t cpu_ns = 0, runq_ns = 0, blocks = 0, preempts = 0, process_cpu_ns = 0;
+};
+ThreadUsage ThreadUsageNow();
+// What `now` adds to `begin` (zeros for a counter that went backwards: another thread's `begin`).
+ThreadUsage ThreadUsageSince(const ThreadUsage& begin, const ThreadUsage& now);
+
+}  // namespace lost::native

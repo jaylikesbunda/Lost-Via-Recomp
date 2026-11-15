@@ -1,0 +1,133 @@
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 57827553..d1f241d0 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -49,6 +50,22 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+ 
+ REXCVAR_DECLARE(bool, gpu_skip_draws);
+ 
++// lost-recomp debug: say which early exit of IssueDraw a draw took, and log draws that bind a
++// k_8 texture (Bink planes). Rate-limited; off by default.
++REXCVAR_DEFINE_BOOL(gpu_log_draw_drops, false, "GPU/D3D12",
++                    "Debug: log draws IssueDraw drops (and why) and draws binding k_8 textures")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace {
++std::atomic<uint32_t> g_draw_drop_logs{0};
++void LogDrawDrop(const char* reason, const rex::graphics::Shader* vs,
++                 const rex::graphics::Shader* ps, uint32_t prim, uint32_t count) {
++  if (!REXCVAR_GET(gpu_log_draw_drops) || g_draw_drop_logs.fetch_add(1) >= 400) return;
++  REXGPU_INFO("Draw dropped ({}): prim {} count {} VS {:016X} PS {:016X}", reason, prim, count,
++              vs ? vs->ucode_data_hash() : 0, ps ? ps->ucode_data_hash() : 0);
++}
++}  // namespace
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -2296,8 +2313,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+ 
+   // Vertex shader analysis.
+   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
++  const uint32_t log_prim = uint32_t(primitive_type);
+   if (!vertex_shader) {
+     // Always need a vertex shader.
++    LogDrawDrop("no vertex shader", nullptr, active_pixel_shader(), log_prim, index_count);
+     return false;
+   }
+   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+@@ -2309,6 +2328,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   if (surface_pitch_is_zero && is_rasterization_done) {
+     // Doesn't actually draw.
+     // Unlikely that zero would even really be legal though.
++    LogDrawDrop("surface pitch 0", vertex_shader, active_pixel_shader(), log_prim, index_count);
+     return true;
+   }
+   D3D12Shader* pixel_shader = nullptr;
+@@ -2329,6 +2349,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     // cache.
+     if (!memexport_used_vertex) {
+       // This draw has no effect.
++      LogDrawDrop("rasterization disabled", vertex_shader, active_pixel_shader(), log_prim,
++                  index_count);
++      if (REXCVAR_GET(gpu_log_draw_drops) && g_draw_drop_logs.load() < 400) {
++        auto sc = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
++        REXGPU_INFO("  ... SQ_PROGRAM_CNTL {:08X} edram_mode {} vs_export_mode {} surface_pitch {} "
++                    "cull_front {} cull_back {} polygonal {}",
++                    regs.Get<reg::SQ_PROGRAM_CNTL>().value, uint32_t(edram_mode),
++                    uint32_t(regs.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode),
++                    uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++                    uint32_t(sc.cull_front), uint32_t(sc.cull_back), primitive_polygonal);
++      }
+       return true;
+     }
+   }
+@@ -2342,12 +2373,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   // Process primitives.
+   PrimitiveProcessor::ProcessingResult primitive_processing_result;
+   if (!primitive_processor_->Process(primitive_processing_result)) {
++    LogDrawDrop("primitive processing failed", vertex_shader, pixel_shader, log_prim, index_count);
+     return false;
+   }
+   if (!primitive_processing_result.host_draw_vertex_count) {
+     // Nothing to draw.
++    LogDrawDrop("0 host vertices", vertex_shader, pixel_shader, log_prim, index_count);
+     return true;
+   }
++  if (REXCVAR_GET(gpu_log_draw_drops) && !pixel_shader) {
++    LogDrawDrop("(not dropped) no pixel shader: depth-only or PS not needed", vertex_shader,
++                active_pixel_shader(), log_prim, index_count);
++  }
+ 
+   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+ 
+@@ -2374,6 +2411,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                    : 0;
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
++    LogDrawDrop("render target update failed", vertex_shader, pixel_shader, log_prim, index_count);
+     return false;
+   }
+ 
+@@ -2404,10 +2442,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+           normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
+           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
++    LogDrawDrop("pipeline configure failed", vertex_shader, pixel_shader, log_prim, index_count);
+     return false;
+   }
+   if (REXCVAR_GET(async_shader_compilation) &&
+       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
++    LogDrawDrop("pipeline still compiling (async)", vertex_shader, pixel_shader, log_prim,
++                index_count);
+     return true;
+   }
+ 
+@@ -2415,6 +2456,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++  if (REXCVAR_GET(gpu_log_draw_drops)) {
++    for (uint32_t i = 0; i < 32; ++i) {
++      xenos::xe_gpu_texture_fetch_t f = regs.GetTextureFetch(i);
++      if (f.type == xenos::FetchConstantType::kTexture && f.format == xenos::TextureFormat::k_8 &&
++          g_draw_drop_logs.fetch_add(1) < 400) {
++        REXGPU_INFO("Draw with k_8 fetch {} (used mask {:08X}): {:08X} {:08X} {:08X} {:08X} "
++                    "{:08X} {:08X} VS {:016X} PS {:016X}",
++                    i, used_texture_mask, f.dword_0, f.dword_1, f.dword_2, f.dword_3, f.dword_4,
++                    f.dword_5, vertex_shader->ucode_data_hash(),
++                    pixel_shader ? pixel_shader->ucode_data_hash() : 0);
++      }
++    }
++  }
+   texture_cache_->RequestTextures(used_texture_mask);
+ 
+   // Bind the pipeline after configuring it and doing everything that may bind
