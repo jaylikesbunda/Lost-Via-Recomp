@@ -16,6 +16,7 @@
 #include "log.h"
 #include "pipeline_library.h"
 #include "pipeline_store.h"
+#include "pipeline_warmup.h"
 #include "profile.h"
 #include "render_targets.h"
 #include "d3d12_backend.h"
@@ -39,6 +40,7 @@
 #include <rex/system/xmemory.h>
 
 #include <xxhash.h>
+#include "flight_recorder.h"
 #include <simde/x86/sse2.h>
 
 #include <algorithm>
@@ -66,6 +68,7 @@ REXCVAR_DECLARE(bool, lost_native_async_pipelines);
 REXCVAR_DECLARE(int32_t, lost_native_pipeline_threads);
 REXCVAR_DECLARE(bool, lost_native_pipeline_wait);
 REXCVAR_DECLARE(bool, lost_native_pipeline_cache);
+REXCVAR_DECLARE(bool, lost_native_precompile_manifest);
 REXCVAR_DECLARE(std::string, lost_native_watch_trace);
 REXCVAR_DECLARE(bool, lost_native_coherency_check);
 REXCVAR_DECLARE(bool, lost_native_implicit_gradients);
@@ -91,6 +94,7 @@ REXCVAR_DEFINE_INT32(lost_native_anisotropy, 1, "Lost native",
                      "Anisotropic filtering of the game's linearly filtered textures with mips, "
                      "at least this many samples per pixel (2, 4, 8 or 16; 1: the game's own)");
 REXCVAR_DECLARE(std::string, lost_native_capture_dir);
+REXCVAR_DECLARE(std::string, lost_native_glitch_catch);
 namespace rex::graphics {
 extern bool g_dxbc_implicit_gradients;  // dxbc_translator_fetch.cpp (local SDK experiment)
 }
@@ -353,14 +357,13 @@ struct DrawRenderer::Impl : GuestMemoryMirror::Sink {
   // the cache evicts go back to free_views (ReleaseViews).
   std::unordered_map<ID3D12Resource*, std::vector<std::pair<uint64_t, uint32_t>>> srv_views;
   std::unordered_map<uint32_t, uint32_t> sampler_indices;  // SamplerKey::value()
-  // Direct-mapped memo in front of srv_views: (resource, component mapping, signed, fetch
-  // dimension) -> descriptor index; a hit skips TextureDescriptor's desc build, XXH3 and map
-  // lookup. Every other field of the SRV desc (format, view dimension, mips, array size) is fixed
-  // per resource, so the key determines the index while the resource lives; ReleaseViews drops
-  // the entries of evicted ones, whose addresses new resources may reuse.
+  // A resolved image may be aliased by texture keys with different compatible view formats.
+  // Keep the whole view description: resource identity and component swizzle alone do not
+  // identify its format, mip range or array range. ReleaseViews drops evicted resources.
   struct SrvMemo {
     ID3D12Resource* resource = nullptr;
-    uint32_t mapping = 0;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    DXGI_FORMAT signed_format = DXGI_FORMAT_UNKNOWN;
     uint8_t is_signed = 0, dimension = 0xFF;
     uint32_t index = 0;
   };
@@ -459,6 +462,29 @@ struct DrawRenderer::Impl : GuestMemoryMirror::Sink {
   static constexpr std::chrono::milliseconds kPipelineWaitBudget{500};
   bool pipeline_wait = false;
   bool generic_pipelines = false;        // --lost_native_generic_pipelines (with worker threads)
+  // Draw flight recorder (flight_recorder.h), on with --lost_native_glitch_catch.
+  struct FlightTexture {
+    uint32_t fetch[3];  // fetch constant dwords 0-2 (address, format, size)
+    uint32_t desc;      // bindless descriptor index the draw reads
+    uint8_t slot, sign, is_signed, stage;  // fetch constant, swizzled signs, signed view, 0 VS / 1 PS
+  };
+  struct FlightDraw {
+    uint32_t index, count;
+    uint8_t prim, generic, textures, memo;
+    uint64_t vs, ps, key;
+    FlightTexture tex[8];
+  };
+  struct FlightFrame {
+    uint64_t frame = ~0ull;
+    std::vector<FlightDraw> draws;
+  };
+  bool flight_on = false;
+  std::string flight_prefix;
+  std::vector<FlightFrame> flight = std::vector<FlightFrame>(flight::kFrames);
+  void FlightRecord(const DrawState& s, const DxbcShader& vs, const DxbcShader* ps, bool generic,
+                    uint64_t key_hash, uint32_t draw_index, uint32_t count, uint32_t prim,
+                    const uint32_t* desc_vs, const uint32_t* desc_ps, const uint8_t* signs);
+  void FlightDump(uint64_t from, uint64_t to, uint64_t label);
   std::vector<Pipeline*> frame_pending;  // pipelines of the frame's skipped draws, once each
   PipelineStore store;
   // What made the pipelines created while running new (logged, kNewPipelineLog lines): a
@@ -486,7 +512,7 @@ struct DrawRenderer::Impl : GuestMemoryMirror::Sink {
   ID3D12GraphicsCommandList* list9_of = nullptr;
   std::filesystem::path library_path;
   size_t prewarm_next = 0;  // into store.loaded_pipelines()
-  uint32_t prewarm_failed = 0, prewarm_frames = 0;
+  uint32_t prewarm_failed = 0, prewarm_frames = 0, prewarm_queued = 0, prewarm_missing = 0;
   double prewarm_ms = 0;
   std::unordered_map<uint32_t, std::vector<uint32_t>> geometry_shaders;
 
@@ -924,6 +950,8 @@ bool DrawRenderer::Impl::Initialize() {
       library_path = dir / "pipelines.d3d12lib";
     }
   }
+  flight_prefix = REXCVAR_GET(lost_native_glitch_catch);
+  flight_on = !flight_prefix.empty();
   if (REXCVAR_GET(lost_native_async_pipelines)) {
     pipeline_wait = REXCVAR_GET(lost_native_pipeline_wait);
     generic_pipelines = REXCVAR_GET(lost_native_generic_pipelines);
@@ -939,7 +967,31 @@ bool DrawRenderer::Impl::Initialize() {
       SetThreadDescription(pso_threads.back().native_handle(), name);
     }
   }
+  auto manifest = ManifestPipelines(sizeof(PipelineKey), kPipelineKeyVersion);
+  const bool precompile_loading = !manifest.empty() && REXCVAR_GET(lost_native_precompile_manifest);
+  store.AddManifest(std::move(manifest));
+  if (auto* runtime = rex::system::kernel_state() ? rex::system::kernel_state()->emulator() : nullptr)
+    DiscoverDiscShaders(runtime->game_data_root() / "SHADERS_XEN_Microcode.sdf");
   Prewarm();  // the first slice before the first frame, which needs some of them
+  if (precompile_loading) {
+    REXLOG_INFO("Lost native warmup: preparing available pipelines before gameplay");
+    while (prewarm_next < store.loaded_pipelines().size()) Prewarm();
+    if (!pso_threads.empty()) {
+      std::unique_lock<std::mutex> lock(pso_mutex);
+      pso_waiting = true;
+      pso_cv.notify_all();
+      pso_wait_cv.notify_all();
+      pso_ready_cv.wait(lock, [this] {
+        return std::none_of(pipelines.begin(), pipelines.end(), [](const auto& entry) {
+          return entry.second->state.load(std::memory_order_acquire) == kCompiling;
+        });
+      });
+      pso_waiting = false;
+    }
+    store.Flush();
+    REXLOG_INFO("Lost native warmup: startup compilation complete ({} unavailable shader entries)",
+                prewarm_missing);
+  }
   return true;
 }
 
@@ -949,7 +1001,7 @@ void DrawRenderer::Impl::PipelineWorker(bool saves, bool on_wait) {
   auto has_work = [this] { return pso_stopping || !pso_jobs.empty() || !prewarm_jobs.empty(); };
   for (;;) {
     if (on_wait) {
-      pso_wait_cv.wait(lock, [this] { return pso_stopping || (pso_waiting && !pso_jobs.empty()); });
+      pso_wait_cv.wait(lock, [this] { return pso_stopping || (pso_waiting && (!pso_jobs.empty() || !prewarm_jobs.empty())); });
     } else if (saves && library.dirty()) {
       // Save once no new pipeline came for 3 s (the burst is over).
       if (!pso_cv.wait_for(lock, std::chrono::seconds(3), has_work)) {
@@ -1529,6 +1581,14 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
 }
 
 void DrawRenderer::Impl::Prewarm() {
+  auto created = TakeCreatedShaders();
+  if (!created.empty()) {
+    REXLOG_INFO("Lost native warmup: {} shader programs discovered during creation", created.size());
+    for (auto& [hash, shader] : created) store.SupplyShader(hash, std::move(shader));
+    prewarm_next = 0;  // revisit manifest pipelines whose shaders were not available yet
+    prewarm_failed = prewarm_frames = prewarm_queued = prewarm_missing = 0;
+    prewarm_ms = 0;
+  }
   const std::vector<PipelineStore::Pipeline>& list = store.loaded_pipelines();
   if (prewarm_next >= list.size()) return;
   const auto t0 = std::chrono::steady_clock::now();
@@ -1541,6 +1601,10 @@ void DrawRenderer::Impl::Prewarm() {
     const PipelineStore::Pipeline& sp = list[prewarm_next++];
     DxbcShader* vs = load(sp.vs_hash, xenos::ShaderType::kVertex);
     DxbcShader* ps = sp.ps_hash ? load(sp.ps_hash, xenos::ShaderType::kPixel) : nullptr;
+    if (!vs || (sp.ps_hash && !ps)) {
+      ++prewarm_missing;
+      continue;  // manifest shader not created yet
+    }
     DxbcShader::Translation* vst = vs ? shaders.Translate(*vs, sp.vs_mod) : nullptr;
     DxbcShader::Translation* pst = ps ? shaders.Translate(*ps, sp.ps_mod) : nullptr;
     if (!vst || (sp.ps_hash && !pst) || sp.key.size() != sizeof(PipelineKey)) {
@@ -1563,7 +1627,21 @@ void DrawRenderer::Impl::Prewarm() {
     key.vs = vst;
     key.ps = pst;
     const uint64_t hash = XXH3_64bits(&key, sizeof(key));
-    if (!pipelines.count(hash)) CreatePipeline(hash, key, *vst, pst, true);
+    if (!pipelines.count(hash)) {
+      CreatePipeline(hash, key, *vst, pst, true);
+      if (store.is_open()) {
+        const auto& vertex = *vs;
+        store.RecordShader(uint32_t(vertex.type()), vertex.ucode_data_hash(), vertex.ucode_dwords(),
+                           vertex.ucode_dword_count());
+        if (ps) {
+          const auto& pixel = *ps;
+          store.RecordShader(uint32_t(pixel.type()), pixel.ucode_data_hash(), pixel.ucode_dwords(),
+                             pixel.ucode_dword_count());
+        }
+        store.RecordPipeline(sp.vs_hash, sp.vs_mod, sp.ps_hash, sp.ps_mod, sp.key.data());
+      }
+      ++prewarm_queued;
+    }
   } while (prewarm_next < list.size() &&
            std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2));
   prewarm_ms +=
@@ -1571,9 +1649,9 @@ void DrawRenderer::Impl::Prewarm() {
   ++prewarm_frames;
   if (prewarm_next == list.size())
     REXLOG_INFO(
-        "Lost native pipelines: prewarm queued {} pipelines ({} failed) in {:.1f} ms "
+        "Lost native pipelines: prewarm queued {} pipelines ({} unavailable, {} failed) in {:.1f} ms "
         "over {} frames",
-        list.size() - prewarm_failed, prewarm_failed, prewarm_ms, prewarm_frames);
+        prewarm_queued, prewarm_missing, prewarm_failed, prewarm_ms, prewarm_frames);
 }
 
 namespace {
@@ -2045,8 +2123,36 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
       }
     }
   }
-  if (!use) use = p ? p : GetPipeline(key_hash, key, vst, pst, variant);
-  const uint8_t state = use->state.load(std::memory_order_acquire);
+  // The draw's own pipeline: `p` must name it too. Leaving `p` null when it is created here made
+  // `use != p` below, so the draw was treated as using the generic pipeline: its shaders were
+  // swapped to the unspecialized ones and the pixel shader to generic_ps (null) while the
+  // specialized pipeline ran - for one draw, the first time each pipeline key was seen. That
+  // pipeline then read no pixel-stage textures or float constants and mis-packed vertex
+  // constants: a single object flashing one frame (red, blue, white).
+  if (!use) {
+    if (!p) p = GetPipeline(key_hash, key, vst, pst, variant);
+    use = p;
+  }
+  uint8_t state = use->state.load(std::memory_order_acquire);
+  if (state == kCompiling && pipeline_wait) {
+    // Waiting at frame end cannot recover a skipped draw: resolves and persistent
+    // offscreen targets have already consumed an incomplete image by then.
+    if (use->prewarm) PromotePipeline(use);
+    const auto start = std::chrono::steady_clock::now();
+    {
+      std::unique_lock<std::mutex> lock(pso_mutex);
+      pso_waiting = true;
+      pso_cv.notify_all();
+      pso_wait_cv.notify_all();
+      pso_ready_cv.wait(lock, [this, use] {
+        return pso_stopping || use->state.load(std::memory_order_acquire) != kCompiling;
+      });
+      pso_waiting = false;
+    }
+    stats.pso_wait_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count());
+    state = use->state.load(std::memory_order_acquire);
+  }
   if (state == kCompiling) {
     if (use->prewarm) PromotePipeline(use);
     if (use->pending_frame != r.frame_index()) {
@@ -2185,14 +2291,16 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
            (uint64_t(tb.is_signed) << 3) ^ (uint64_t(tb.dimension) << 4)) *
           0x9E3779B97F4A7C15ull;
       SrvMemo& m = srv_memo[sh >> (64 - kSrvMemoBits)];
-      if (m.resource == b.resource && m.mapping == mapping &&
+      if (m.resource == b.resource && std::memcmp(&m.view, &b.srv, sizeof(b.srv)) == 0 &&
+          m.signed_format == b.srv_signed_format &&
           m.is_signed == uint8_t(tb.is_signed) && m.dimension == uint8_t(tb.dimension)) {
         index = m.index;
         profile::Count(profile::kSrvMemoHit);
       } else {
         index = TextureDescriptor(b, tb);
         m.resource = b.resource;
-        m.mapping = mapping;
+        m.view = b.srv;
+        m.signed_format = b.srv_signed_format;
         m.is_signed = uint8_t(tb.is_signed);
         m.dimension = uint8_t(tb.dimension);
         m.index = index;
@@ -2625,6 +2733,9 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   const uint32_t n_desc_ps = ps ? BindTextures(bind, *ps, desc_ps) : 1;
   if (!ps) desc_ps[0] = 0;
   profile::Mark(profile::kTextures);
+  if (flight_on)
+    FlightRecord(s, *vs, ps, vs != vs_selected, XXH3_64bits(&key, sizeof(key)), draw_index, count,
+                 uint32_t(prim), desc_vs, desc_ps, signs);
 
   DxbcShaderTranslator::SystemConstants sys;
   FillSystemConstants(s, regs, prim, polygonal, index_endian, vp, used_textures, signs, sys);
@@ -3007,8 +3118,81 @@ bool DrawRenderer::FrameIncomplete() const {
   return m.pipeline_wait && !m.frame_pending.empty();
 }
 
+void DrawRenderer::Impl::FlightRecord(const DrawState& s, const DxbcShader& vs,
+                                      const DxbcShader* ps, bool generic, uint64_t key_hash,
+                                      uint32_t draw_index, uint32_t count, uint32_t prim,
+                                      const uint32_t* desc_vs, const uint32_t* desc_ps,
+                                      const uint8_t* signs) {
+  const uint64_t frame = r.frame_index();
+  FlightFrame& ff = flight[frame % flight.size()];
+  if (ff.frame != frame) {
+    ff.frame = frame;
+    ff.draws.clear();
+  }
+  FlightDraw d = {};
+  d.index = draw_index;
+  d.count = count;
+  d.prim = uint8_t(prim);
+  d.generic = generic;
+  d.vs = vs.ucode_data_hash();
+  d.ps = ps ? ps->ucode_data_hash() : 0;
+  d.key = key_hash;
+  auto add = [&](const DxbcShader& sh, const uint32_t* desc, uint8_t stage) {
+    for (const auto& tb : sh.GetTextureBindingsAfterTranslation()) {
+      if (d.textures >= std::size(d.tex)) return;
+      FlightTexture& t = d.tex[d.textures++];
+      const uint32_t* f = s.fetch(tb.fetch_constant);
+      t.fetch[0] = f[0];
+      t.fetch[1] = f[1];
+      t.fetch[2] = f[2];
+      t.desc = tb.bindless_descriptor_index < 64 ? desc[tb.bindless_descriptor_index] : ~0u;
+      t.slot = uint8_t(tb.fetch_constant);
+      t.sign = signs[tb.fetch_constant & 31];
+      t.is_signed = uint8_t(tb.is_signed);
+      t.stage = stage;
+    }
+  };
+  add(vs, desc_vs, 0);
+  if (ps) add(*ps, desc_ps, 1);
+  ff.draws.push_back(d);
+}
+
+void DrawRenderer::Impl::FlightDump(uint64_t from, uint64_t to, uint64_t label) {
+  const std::string path = flight_prefix + "draws-" + std::to_string(label) + ".txt";
+  std::FILE* f = std::fopen(path.c_str(), "w");
+  if (!f) return;
+  std::fprintf(f, "# draw flight record, native frames %llu-%llu (flash at %llu)\n",
+               (unsigned long long)from, (unsigned long long)to, (unsigned long long)label);
+  std::fprintf(f, "# frame draw prim count gen key vs ps | tex: stage slot fetch0 fetch1 fetch2 "
+                  "desc sign signed_view\n");
+  for (uint64_t frame = from; frame <= to; ++frame) {
+    const FlightFrame& ff = flight[frame % flight.size()];
+    if (ff.frame != frame) {
+      std::fprintf(f, "%llu missing (not in the ring)\n", (unsigned long long)frame);
+      continue;
+    }
+    for (const FlightDraw& d : ff.draws) {
+      std::fprintf(f, "%llu %u %u %u %u %016llX %016llX %016llX |", (unsigned long long)frame,
+                   d.index, d.prim, d.count, d.generic, (unsigned long long)d.key,
+                   (unsigned long long)d.vs, (unsigned long long)d.ps);
+      for (uint32_t i = 0; i < d.textures; ++i) {
+        const FlightTexture& t = d.tex[i];
+        std::fprintf(f, " %c%u %08X %08X %08X %u %02X %u", t.stage ? 'p' : 'v', t.slot,
+                     t.fetch[0], t.fetch[1], t.fetch[2], t.desc, t.sign, t.is_signed);
+      }
+      std::fputc('\n', f);
+    }
+  }
+  std::fclose(f);
+  REXLOG_INFO("Lost native flight recorder: wrote {}", path);
+}
+
 void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->WaitForPipelines();  // after the frame's submission: the GPU runs it meanwhile
+  if (impl_->flight_on) {
+    uint64_t from, to, label;
+    while (flight::Take(impl_->r.frame_index(), &from, &to, &label)) impl_->FlightDump(from, to, label);
+  }
   stats_.views =
       impl_->views_allocated - (kViewTableStart + kFirstTexture) - impl_->free_views.size();
   stats_.watch_faults = impl_->mirror.watch_faults.exchange(0, std::memory_order_relaxed);

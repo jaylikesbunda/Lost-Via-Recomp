@@ -222,7 +222,6 @@ void TextureCache::WorkerMain(UploadList* uploads) {
     UntileJob job = std::move(jobs_.front());
     jobs_.pop_front();
     lock.unlock();
-    ArmWatches(job.key, job.base_bytes, job.mips_bytes);
     worker_untile_ns_.fetch_add(RunUntile(job, &scratch), std::memory_order_relaxed);
     if (job.deferred)
       worker_record_ns_.fetch_add(RecordDeferredUpload(job, uploads), std::memory_order_relaxed);
@@ -694,9 +693,10 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   if (!upload_.Allocate(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, frame_fence, &a))
     return false;
 
-  // ClearDirty's order, with the watches armed by the untile job just before it reads: their
-  // protection changes (about 20 µs each under Wine) run off the render thread.
+  // Arm before copying: a guest write after this point must dirty the texture again.
+  // Workers must not read guest memory later, after the game has reused it.
   t.dirty.store(false, std::memory_order_release);
+  ArmWatches(key, t.base_bytes, t.mips_bytes);
   UntileJob job;
   UploadCopies& copies = job.copies;
   copies.texture = t.resource.Get();
@@ -723,11 +723,15 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   job.key = key;
   job.layout = t.layout;
   if (key.base_page) {
-    job.guest.base = membase_ + (key.base_page << 12);
+    const uint8_t* src = membase_ + (key.base_page << 12);
+    job.base_snapshot.assign(src, src + t.base_bytes);
+    job.guest.base = job.base_snapshot.data();
     job.guest.base_size = t.base_bytes;
   }
   if (key.mip_page) {
-    job.guest.mips = membase_ + (key.mip_page << 12);
+    const uint8_t* src = membase_ + (key.mip_page << 12);
+    job.mips_snapshot.assign(src, src + t.mips_bytes);
+    job.guest.mips = job.mips_snapshot.data();
     job.guest.mips_size = t.mips_bytes;
   }
   job.footprints = std::move(footprints_);
@@ -738,7 +742,6 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   job.mips_bytes = t.mips_bytes;
   job.conversion = t.host->conversion;
   if (workers_.empty()) {
-    ArmWatches(job.key, job.base_bytes, job.mips_bytes);
     stats_.untile_ns += RunUntile(job, &untile_scratch_);
     if (job.deferred) stats_.upload_record_ns += RecordDeferredUpload(job, &upload_lists_[0]);
     footprints_ = std::move(job.footprints);

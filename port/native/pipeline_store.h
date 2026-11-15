@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <utility>
 
 namespace lost::native {
 
@@ -40,6 +41,12 @@ class PipelineStore {
   // key_version, or cut at the last whole record) and opens it for appending. Stays closed if
   // key_size is over kMaxKeySize.
   void Open(const std::filesystem::path& dir, uint32_t key_size, uint32_t key_version);
+  void AddManifest(std::vector<Pipeline> pipelines) {
+    for (auto& pipeline : pipelines) loaded_pipelines_.push_back(std::move(pipeline));
+  }
+  void SupplyShader(uint64_t hash, Shader shader) {
+    loaded_shaders_.try_emplace(hash, std::move(shader));
+  }
   bool is_open() const { return file_ != nullptr; }
 
   // Records from earlier runs, in the order they were first seen.

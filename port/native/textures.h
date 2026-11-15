@@ -262,6 +262,8 @@ class TextureCache {
     TextureKey key;
     rex::graphics::texture_util::TextureGuestLayout layout;
     GuestTextureMemory guest;
+    // Owned bytes keep worker reads independent of later guest writes.
+    std::vector<uint8_t> base_snapshot, mips_snapshot;
     std::vector<HostSubresource> footprints;
     uint8_t* dst = nullptr;
     uint64_t size = 0;

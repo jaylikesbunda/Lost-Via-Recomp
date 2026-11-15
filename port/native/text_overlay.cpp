@@ -90,7 +90,13 @@ void DrawTextOverlay(ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDL
   }
   if (rects.empty()) return;
   const float foreground[4] = {1.0f, 1.0f, 0.35f, 1.0f};
-  list->ClearRenderTargetView(rtv, foreground, UINT(rects.size()), rects.data());
+  // Keep each driver clear small: some D3D12 drivers fail on the large rectangle
+  // arrays produced by a whole line of text.
+  constexpr size_t kRectsPerClear = 4;
+  for (size_t first = 0; first < rects.size(); first += kRectsPerClear) {
+    const UINT count = UINT(std::min(kRectsPerClear, rects.size() - first));
+    list->ClearRenderTargetView(rtv, foreground, count, rects.data() + first);
+  }
 }
 
 }  // namespace lost::native

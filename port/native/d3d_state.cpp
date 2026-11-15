@@ -18,12 +18,15 @@
 #include <fmt/format.h>
 
 REXCVAR_DEFINE_BOOL(lost_native_shader_hash_check, false, "Lost native",
-                    "Hash every loaded shader's whole ucode and log when the tracker's shader "
-                    "hash memo (ucode address, length and both ends) would have missed a change");
+                    "Log shader replacements whose address, length and sampled ends stayed "
+                    "the same (whole-program identity is always checked)");
 
 REXCVAR_DEFINE_BOOL(lost_native_stream_log, false, "Lost native",
                     "Log the push-buffer tracker's counters now and then (decoded dwords, "
                     "packets, draws, jumps, resyncs, torn packets, unknown opcodes)");
+REXCVAR_DEFINE_BOOL(lost_native_draw_state_check, false, "Lost native",
+                    "Compare shader constants and fetch state at the first draw packet with "
+                    "the state used after its D3D call returns");
 
 namespace lost::native {
 namespace {
@@ -248,12 +251,12 @@ void GuestStateTracker::LoadShader(uint32_t type, uint32_t address, uint32_t dwo
 }
 
 uint64_t GuestStateTracker::ShaderBinding(uint32_t address, uint32_t dwords) {
-  // The content hash of the ucode at `address`, hashed once per shader: the D3D loads both
-  // shaders of most draws again (IM_LOAD), and hashing their whole ucode each time was 6% of
-  // the game's render thread on the Steam Deck. A shader replaced in place is told by its
-  // length and its first and last ShaderBindingMemo::kSample / 2 dwords, as the draw side's
-  // shader memo tells one (draw.cpp LoadShader).
+  // IM_LOAD may reuse an address and length while only the program's middle changes.
+  // Sampling its ends cannot identify that replacement: Draw's shader memo trusts this
+  // binding for the entire program. Hash at each load, rather than at every draw; the
+  // sampled memo below is only diagnostic and never decides shader identity.
   const uint32_t* ucode = reinterpret_cast<const uint32_t*>(Physical(address));
+  const uint64_t full = XXH3_64bits(ucode, size_t(dwords) * 4);
   uint32_t sample[ShaderBindingMemo::kSample];
   for (uint32_t i = 0; i < ShaderBindingMemo::kSample / 2; ++i) {
     sample[i] = ucode[std::min(i, dwords - 1)];
@@ -262,25 +265,22 @@ uint64_t GuestStateTracker::ShaderBinding(uint32_t address, uint32_t dwords) {
   ShaderBindingMemo& memo = binding_memo_[(address >> 4) % std::size(binding_memo_)];
   if (memo.dwords == dwords && memo.ucode == address &&
       std::memcmp(memo.sample, sample, sizeof(sample)) == 0) {
-    if (REXCVAR_GET(lost_native_shader_hash_check)) {
-      // A patch to the middle of the ucode only (the D3D's declaration patching goes through
-      // IM_LOAD_IMMEDIATE, not here) would pass the sample: the check tells if a title does it.
-      const uint64_t full = XXH3_64bits(ucode, size_t(dwords) * 4);
-      if (full != memo.binding) {
+    if (full != memo.binding) {
+      if (REXCVAR_GET(lost_native_shader_hash_check)) {
         static uint32_t logged = 0;
         if (++logged <= 16)
           REXLOG_WARN("Lost native state: shader {:08X} ({} dwords) changed inside its sample: "
                       "memo {:016X}, now {:016X}",
                       address, dwords, memo.binding, full);
-        memo.binding = full;
       }
+      memo.binding = full;
     }
     return memo.binding;
   }
   memo.ucode = address;
   memo.dwords = dwords;
   std::memcpy(memo.sample, sample, sizeof(sample));
-  memo.binding = XXH3_64bits(ucode, size_t(dwords) * 4);
+  memo.binding = full;
   return memo.binding;
 }
 
@@ -381,6 +381,9 @@ void GuestStateTracker::HandlePacket(const uint8_t* base) {
               packet_address_, current_fn_);
       }
       if (!first_draw_valid_) {
+        draw_inputs_.Capture();
+        if (REXCVAR_GET(lost_native_draw_state_check))
+          first_draw_inputs_ = XXH3_64bits(regs_ + 0x4000, (0x4930 - 0x4000) * 4);
         first_draw_valid_ = true;
         first_draw_op_ = op;
         first_draw_initiator_ =
@@ -464,7 +467,19 @@ bool GuestStateTracker::ReadDrawState(const uint8_t* base, const HookArgs& a, Dr
   if (!device || device != device_) return false;
   // Field by field rather than from a DrawState{}: the render thread's queue entries are
   // value-initialized already, and this runs for every draw on the guest thread.
+  if (first_draw_valid_ && REXCVAR_GET(lost_native_draw_state_check) &&
+      first_draw_inputs_ != XXH3_64bits(regs_ + 0x4000, (0x4930 - 0x4000) * 4)) {
+    static uint32_t changes = 0;
+    if (++changes <= 32)
+      REXLOG_WARN("Lost native draw state: constants/fetch changed after draw packet in call {:08X}",
+                  uint32_t(a.fn));
+  }
   s->regs = regs_;
+  if (!draw_inputs_.changes().empty()) {
+    std::memcpy(draw_regs_, regs_, sizeof(regs_));
+    for (const auto& [reg, value] : draw_inputs_.changes()) draw_regs_[reg] = value;
+    s->regs = draw_regs_;
+  }
   s->fn = a.fn;
   s->device = device;
   s->primitive = a.r[1] & 0x3F;
@@ -509,13 +524,13 @@ bool GuestStateTracker::ReadDrawState(const uint8_t* base, const HookArgs& a, Dr
       s->count = a.r[2];
       // Vertex fetch 95 (fetch constant 31, dwords 4-5): the inline vertices, which the call
       // wrote as a type-0 packet before its draw.
-      s->inline_vertices = regs_[0x4800 + 31 * 6 + 4] & ~3u;
+      s->inline_vertices = s->regs[0x4800 + 31 * 6 + 4] & ~3u;
       break;
     case HookFn::kBeginIndexedVertices:  // (dev, prim, base vertex, vertices, index count, ...)
       s->base_vertex = a.r[2];
       s->count = a.r[4];
       s->indexed = true;
-      s->inline_vertices = regs_[0x4800 + 31 * 6 + 4] & ~3u;
+      s->inline_vertices = s->regs[0x4800 + 31 * 6 + 4] & ~3u;
       if (!dma) return false;
       index_from_packet();
       break;
@@ -525,6 +540,12 @@ bool GuestStateTracker::ReadDrawState(const uint8_t* base, const HookArgs& a, Dr
   s->vs = vs_;
   s->ps = ps_;
   return true;
+}
+
+void GuestStateTracker::RecordDrawInputs(bool restore) {
+  if (!sink_) return;
+  for (const auto& [reg, value] : draw_inputs_.changes())
+    if (value != regs_[reg]) sink_->Append({reg, restore ? regs_[reg] : value});
 }
 
 }  // namespace lost::native

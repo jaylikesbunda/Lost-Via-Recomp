@@ -291,6 +291,8 @@ struct Sampled {
   HANDLE handle = nullptr;
   uint64_t samples = 0, busy = 0;
   std::map<std::string, uint64_t> self, inclusive;
+  // Waiting samples by the first lost.exe frames on their stack: who waits, and on whose call.
+  std::map<std::string, uint64_t> waits;
 };
 
 bool Sample(HANDLE t, int depth, std::vector<DWORD64>& pcs) {
@@ -347,7 +349,22 @@ std::string ProfileThreads(int seconds) {
       if (!Sample(s.handle, 16, pcs)) continue;
       ++s.samples;
       const std::string& top = sym.Name(pcs[0]);
-      if (IsWaitSymbol(top)) continue;
+      if (IsWaitSymbol(top)) {
+        std::string where;
+        int frames = 0;
+        // The first frames above the OS wait: the runtime call, then the game's callers.
+        for (DWORD64 pc : pcs) {
+          const std::string& n = sym.Name(pc);
+          if (n.rfind("ntdll", 0) == 0 || n.rfind("KERNELBASE", 0) == 0 ||
+              n.rfind("KERNEL32", 0) == 0 || n.rfind("win32u", 0) == 0) {
+            continue;
+          }
+          where += (frames ? " <- " : "") + n.substr(0, 90);
+          if (++frames == 5) break;
+        }
+        ++s.waits[where.empty() ? top : where];
+        continue;
+      }
       ++s.busy;
       ++s.self[top];
       std::vector<std::string> seen;
@@ -373,8 +390,10 @@ std::string ProfileThreads(int seconds) {
                    100.0 * double(s.busy) / double(s.samples),
                    static_cast<unsigned long long>(s.busy),
                    static_cast<unsigned long long>(s.samples));
-      for (const char* kind : {"self", "inclusive"}) {
-        auto& m = std::strcmp(kind, "self") == 0 ? s.self : s.inclusive;
+      for (const char* kind : {"self", "inclusive", "waiting in"}) {
+        auto& m = std::strcmp(kind, "self") == 0        ? s.self
+                  : std::strcmp(kind, "inclusive") == 0 ? s.inclusive
+                                                        : s.waits;
         std::vector<std::pair<uint64_t, std::string>> top;
         for (auto& [n, c] : m) top.emplace_back(c, n);
         std::sort(top.rbegin(), top.rend());

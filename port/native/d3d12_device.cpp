@@ -4,6 +4,7 @@
 
 #include "clock.h"
 #include "gpu_timer.h"
+#include <d3d12sdklayers.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -164,6 +165,21 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
              "D3D12CreateDevice"))
     return false;
   DXGI_ADAPTER_DESC1 ad = {};
+  // Validation normally goes only to the debugger. Keep actionable GPU errors
+  // in the session log so transient bad bindings can be traced after a run.
+  ComPtr<ID3D12InfoQueue1> validation;
+  if (SUCCEEDED(device_.As(&validation))) {
+    DWORD cookie = 0;
+    const HRESULT validation_hr = validation->RegisterMessageCallback(
+        [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+           D3D12_MESSAGE_ID id, LPCSTR description, void*) {
+          if (severity > D3D12_MESSAGE_SEVERITY_WARNING) return;
+          static std::atomic<uint32_t> count{0};
+          if (count.fetch_add(1, std::memory_order_relaxed) < 128)
+            REXLOG_WARN("Lost native D3D12 validation {}: {}", uint32_t(id), description);
+        }, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+    REXLOG_INFO("Lost native D3D12 validation callback: {:08X}", uint32_t(validation_hr));
+  }
   adapter->GetDesc1(&ad);
   vendor_id_ = ad.VendorId;
   char name[128] = {};

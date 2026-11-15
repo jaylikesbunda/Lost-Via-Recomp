@@ -1,0 +1,18 @@
+# Native renderer test runs: the title screen accepts START at ~25 s in builds that precompile the
+# pipeline manifest at start-up (later than the emulated path's ~22 s). Continue from the save in
+# the --user_data_root, then walk.
+28.0 START
+33.0 LEFT
+35.0 A
+38.0 A
+41.0 A
+# Skip intro text once the checkpoint loads.
+70.0 A
+75.0 A
+# Walk forward, look around, walk again, turn (streams new areas and materials in).
+85.0  stick 0 1 0 0 hold 8
+95.0  stick 0 0 0.6 0 hold 3
+100.0 stick 0 1 0 0 hold 10
+112.0 stick 0.6 0.8 0 0 hold 8
+122.0 stick 0 1 0.3 0 hold 10
+134.0 stick -0.6 0.8 0 0 hold 8

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lost: Via Domus</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<button class="icon" id="settingsBtn" title="Settings" aria-label="Settings">
+  <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>
+</button>
+
+<main id="home">
+  <h1>LOST<span>Via Domus</span></h1>
+
+  <p class="status" id="status">Checking...</p>
+
+  <button class="main" id="mainBtn" disabled>...</button>
+  <button class="link" id="altBtn" hidden></button>
+
+  <div class="progress" id="progress" hidden>
+    <div class="bar"><i></i></div>
+  </div>
+  <button class="link" id="logToggle" hidden>Show log</button>
+
+  <ul class="missing" id="missing" hidden></ul>
+  <p class="err" id="err" hidden></p>
+
+  <pre id="log" hidden></pre>
+</main>
+
+<section id="settings" hidden>
+  <button class="link back" id="backBtn">Back</button>
+  <h2>Settings</h2>
+
+  <div class="row">
+    <span>Frame rate</span>
+    <div class="seg" id="fpsSeg">
+      <button data-fps="30">30</button>
+      <button data-fps="60">60</button>
+      <button data-fps="120">120</button>
+      <button data-fps="144">144</button>
+      <button data-fps="0">Max</button>
+    </div>
+  </div>
+
+  <label class="row">
+    <span>Native renderer <small>Experimental</small></span>
+    <input type="checkbox" id="nativeToggle"><i class="toggle"></i>
+  </label>
+
+  <div class="row">
+    <span>Game folder <small id="repoPath"></small></span>
+    <button class="link" id="repoPick">Change</button>
+  </div>
+
+  <div class="row">
+    <span>Logs</span>
+    <button class="link" id="openLogs">Open folder</button>
+  </div>
+
+  <p class="err" id="settingsErr" hidden></p>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

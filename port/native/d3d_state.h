@@ -30,6 +30,7 @@
 
 #include "lost_d3d.h"
 #include "hook_args.h"
+#include "draw_input_history.h"
 
 namespace lost::native {
 
@@ -124,7 +125,10 @@ class GuestStateTracker {
   bool ReadDrawState(const uint8_t* base, const HookArgs& args, DrawState* out);
   // Marks the start of a draw call's window: the first draw packet decoded after it is the
   // call's (its index buffer).
-  void BeginDrawCall() { first_draw_valid_ = false; }
+  void BeginDrawCall() { first_draw_valid_ = false; draw_inputs_.Begin(); }
+  // Temporarily replay the draw-time constants into the queued register stream,
+  // then restore the post-call values for following commands. Does not mutate regs_.
+  void RecordDrawInputs(bool restore);
 
   const uint32_t* regs() const { return regs_; }
   uint32_t device() const { return device_; }
@@ -151,6 +155,7 @@ class GuestStateTracker {
   void Attach(uint8_t* base, uint32_t device);
   void Put(uint32_t reg, uint32_t value) {
     if (reg >= kGuestRegisterCount || regs_[reg] == value) return;
+    draw_inputs_.BeforeWrite(reg, regs_[reg]);
     regs_[reg] = value;
     if (sink_) sink_->Append({reg, value});
   }
@@ -161,7 +166,7 @@ class GuestStateTracker {
   void HandlePacket(const uint8_t* base);
   void LoadShader(uint32_t type, uint32_t address, uint32_t dwords);
   uint64_t ShaderBinding(uint32_t address, uint32_t dwords);
-  // The content hashes of the shaders loaded lately, by ucode address, length and both ends.
+  // Diagnostic samples of recent shader loads; identity always hashes the full program.
   struct ShaderBindingMemo {
     static constexpr uint32_t kSample = 32;
     uint32_t ucode = 0, dwords = 0;
@@ -184,6 +189,7 @@ class GuestStateTracker {
   std::vector<uint32_t> pkt_;  // host order
   // The call's first draw packet: DRAW_INDX's index base and size dwords.
   bool first_draw_valid_ = false;
+  uint64_t first_draw_inputs_ = 0;
   uint32_t first_draw_op_ = 0, first_draw_initiator_ = 0, first_draw_index_base_ = 0,
            first_draw_index_size_ = 0;
 
@@ -191,6 +197,8 @@ class GuestStateTracker {
   std::vector<uint32_t> vs_imm_, ps_imm_;  // big-endian ucode of the last immediate loads
   uint32_t imm_seq_ = 0;
   uint32_t regs_[kGuestRegisterCount] = {};
+  DrawInputHistory draw_inputs_;
+  uint32_t draw_regs_[kGuestRegisterCount] = {};
   RegLog* sink_ = nullptr;  // RecordInto
   bool synced_ = false;     // a sink got the whole register file
   Counters counters_;

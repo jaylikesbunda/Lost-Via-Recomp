@@ -34,3 +34,7 @@ __pycache__/
 /CLAUDE.md
 /PLAN.md
 /f_*.txt
+launcher/src-tauri/target/
+launcher/node_modules/
+launcher/src-tauri/gen/
+launcher/src-tauri/resources/

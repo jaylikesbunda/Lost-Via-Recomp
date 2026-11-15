@@ -1,33 +1,69 @@
-# Lost: Via Domus — Xbox 360 Recompiled
+<div align="center">
+  <h1>Lost: Via Domus</h1>
+  <p>A static recompilation of the Xbox 360 version into a native Windows game.</p>
+  <p>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/Licence-MIT-555?style=for-the-badge" alt="Licence: MIT"></a>
+  </p>
+</div>
 
-Play the Xbox 360 version of Lost: Via Domus on Windows. This work-in-progress port uses [ReXGlue](https://github.com/rexglue/rexglue-sdk) to statically recompile the game's code. It does not include the game or its data.
+> [!IMPORTANT]
+> The game is not included. You need your own extracted copy of the Xbox 360 game **Lost: Via Domus**.
+> No game code or game files are distributed.
+
+The game's PowerPC code is translated to C++ with [ReXGlue](https://github.com/rexglue/rexglue-sdk). This is a work in progress.
+
+| Release | Title ID | Status |
+| --- | --- | --- |
+| USA / Europe | `5553080F` | Supported |
+| Other regions and revisions | | Not supported |
+
+The supported `default.xex` has SHA-256 `443200592190486539885ECEBDC65D2F8DD7200F3B587EE35D70CD8A4A5B256C`.
+
+## Features
+
+- **Frame rate.** 30 (console), 60, 120, 144 or uncapped.
+- **Display.** Resolution, anti-aliasing, sharpening and texture filtering, set from the game's Options page.
+- **Input.** Controller or keyboard.
+- **Native renderer.** An experimental Direct3D 12 renderer, off by default.
 
 ## Requirements
 
-- Windows 10 or 11, a 64-bit x86-64-v3 CPU, and a Direct3D 12 capable GPU.
-- Your own copy of the Xbox 360 game, extracted to a folder. The supported USA/Europe executable has title ID `5553080F` and SHA-256 `443200592190486539885ECEBDC65D2F8DD7200F3B587EE35D70CD8A4A5B256C`.
-- A build of this project. See [BUILDING.md](BUILDING.md) to build from source.
+| Component | Requirement |
+| --- | --- |
+| OS | Windows 10 or 11, 64-bit |
+| CPU | x86-64-v3, including AVX2 and FMA |
+| GPU | Direct3D 12 |
 
-## Setup and play
+## Quick start
 
-Place the extracted game files, including `default.xex`, `Yeti.big`, and the video folders, in a `game` folder next to `lost.exe`. Run `lost.exe`. Saves and shader caches default to `Documents\lost`; settings are saved to `lost.toml` beside the executable.
+1. Build `lost.exe` (see below).
+2. Put your extracted game files, including `default.xex`, `Yeti.big` and the video folders, in a `game` folder next to `lost.exe`.
+3. Run `lost.exe`.
 
-The opening sequence, menus and gameplay have been tested, but a complete playthrough has not yet been verified. Higher frame rates are experimental. The default renderer uses the emulated Xenos graphics path. The native renderer is experimental and can be enabled with `--lost_native --lost_native_primary --lost_target_fps=120` on the command line.
-
-## Controls and settings
-
-Use a controller or keyboard for the game. In the game's Options page, select the added frame rate, resolution, anti-aliasing, sharpening or texture filter row and press Y or left/right to change it. Some graphics settings require a restart. The F1 panel provides further settings.
+Saves and shader caches are stored in `Documents\lost`. Settings are saved to `lost.toml` next to the executable.
 
 | Key | Action |
 | --- | --- |
 | F1 | Settings panel |
-| F2 | Toggle performance HUD |
-| F3 / F4 / ` | SDK overlays and console |
+| F2 | Performance HUD |
 
-If the game crashes, reports are written under `logs` next to the executable; attach the crash report when reporting a problem.
+To try the native renderer, start the game with `--lost_native_primary --lost_target_fps=120`.
 
-## Credits and license
+## Known limitations
 
-Made possible by [ReXGlue](https://github.com/rexglue/rexglue-sdk), [Xenia](https://github.com/xenia-project/xenia), [GRAW 360 Recompiled](https://github.com/Juansolo457/graw360-recomp), and [pgr4-native](https://github.com/shaunsingh/pgr4-native). See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for their licenses. Original project code is available under the [MIT License](LICENSE).
+A full playthrough has not been verified yet. Frame rates above 30 and the native renderer are experimental. Some graphics settings need a restart.
 
-Lost: Via Domus is © Ubisoft Entertainment and ABC Studios. This independent project is not affiliated with or endorsed by Ubisoft, ABC, or Disney. You must supply your own game files.
+If the game crashes, a report is written to `logs` next to the executable. Please attach it when reporting a problem.
+
+<details>
+<summary><b>Building from source</b></summary>
+
+See [BUILDING.md](BUILDING.md).
+
+</details>
+
+## Credits and legal
+
+Built on [ReXGlue](https://github.com/rexglue/rexglue-sdk) and [Xenia](https://github.com/xenia-project/xenia), with work adapted from [GRAW 360 Recompiled](https://github.com/Juansolo457/graw360-recomp) and [pgr4-native](https://github.com/shaunsingh/pgr4-native). Third-party licences are in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+
+Unofficial fan project, not affiliated with or endorsed by Ubisoft, ABC Studios or Disney. Lost: Via Domus and related names belong to their owners. Project code is under the [MIT License](LICENSE), which does not cover game code, game data or generated code.

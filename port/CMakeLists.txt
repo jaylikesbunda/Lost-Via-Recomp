@@ -21,6 +21,7 @@ set(LOST_SOURCES
     src/crash_report.cpp
     src/bink_probe.cpp
     src/perf.cpp
+    src/thread_records.cpp
     src/settings.cpp
     src/autopilot.cpp
     src/ui_probe.cpp

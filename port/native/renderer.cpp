@@ -572,7 +572,9 @@ void NativeRenderer::QueueDraw(const uint8_t* base, const HookArgs& args) {
     if (d.prep.copy_segment) b.segments.push_back(d.copy_begin);
     d.state.regs = nullptr;
     d.state.vs.immediate = d.state.ps.immediate = nullptr;  // Prepare loaded the shaders
+    GuestState().RecordDrawInputs(false);
     q.Push(Queue::kDraw, uint32_t(b.draws.size() - 1));
+    GuestState().RecordDrawInputs(true);  // Push may have published and selected a new batch.
     profile::Mark(profile::kCapRecord);
   }
   q.AddHook(Ticks() - t0);

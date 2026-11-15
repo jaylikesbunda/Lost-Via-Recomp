@@ -4,6 +4,7 @@
 
 #include "clock.h"
 #include "d3d12_device.h"
+#include "flight_recorder.h"
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -100,6 +101,12 @@ struct Catcher {
   uint64_t consumed = 0;  // frames before this are part of a reported jump
   uint64_t dump_from = 0, dump_to = 0, dump_label = 0;
   bool dump_pending = false;
+  const char* dump_kind = "glitch";
+  // Local flashes (Lost): a few blocks jump away and come back while the rest of the image does
+  // not, which the whole-image jump test above misses for a single object.
+  uint64_t local_consumed = 0;
+  uint32_t flashes = 0;
+  bool LocalFlash(uint64_t n);
   std::deque<float> steps;
   std::vector<float> scratch;
   std::vector<uint32_t> sums;
@@ -172,20 +179,92 @@ void Catcher::Add(const RecordHeader& h, const uint8_t* rgba) {
     dump_to = std::min(n + kPad, dump_from + kRing - 1);
     break;
   }
+  if (!dump_pending) LocalFlash(n);
   if (dump_pending && n >= dump_to) {
     dump_pending = false;
     if (dumps < kMaxDumps) {
       ++dumps;
-      Dump(dump_from, n, "glitch", dump_label);
+      Dump(dump_from, n, dump_kind, dump_label);
     }
+    dump_kind = "glitch";
   }
+}
+
+// Blocks of frames i..n-1 at least kAway from frame i-1 in some channel (in every frame of the
+// flash), back within kBack at n, and still (within kBack) from i-2 to i-1: an object that
+// changes for 1-4 frames and returns, not motion (which does not come back) or a cut or fade
+// (which moves most blocks).
+bool Catcher::LocalFlash(uint64_t n) {
+  constexpr float kAway = 32.0f, kBack = 10.0f;
+  if (n < 3) return false;
+  const size_t values = At(n).means.size();
+  const size_t blocks = values / 3;
+  if (!blocks) return false;
+  for (uint64_t i = n >= kMaxLen ? n - kMaxLen : 2; i < n; ++i) {
+    if (i < 2 || i < local_consumed || !Contiguous(i - 2, n)) continue;
+    const Frame& pre = At(i - 2);
+    const Frame& base = At(i - 1);
+    const Frame& back = At(n);
+    if (pre.means.size() != values || base.means.size() != values) continue;
+    size_t flagged = 0, first = 0;
+    float first_base[3] = {}, first_away[3] = {};
+    for (size_t b = 0; b < blocks; ++b) {
+      float still = 0, ret = 0;
+      for (uint32_t c = 0; c < 3; ++c) {
+        still = std::max(still, std::fabs(base.means[b * 3 + c] - pre.means[b * 3 + c]));
+        ret = std::max(ret, std::fabs(back.means[b * 3 + c] - base.means[b * 3 + c]));
+      }
+      if (still > kBack || ret > kBack) continue;
+      float away = 1e9f;
+      for (uint64_t k = i; k < n; ++k) {
+        const Frame& fk = At(k);
+        if (fk.means.size() != values) {
+          away = 0;
+          break;
+        }
+        float d = 0;
+        for (uint32_t c = 0; c < 3; ++c)
+          d = std::max(d, std::fabs(fk.means[b * 3 + c] - base.means[b * 3 + c]));
+        away = std::min(away, d);
+      }
+      if (away < kAway) continue;
+      if (!flagged++) {
+        first = b;
+        for (uint32_t c = 0; c < 3; ++c) {
+          first_base[c] = base.means[b * 3 + c];
+          first_away[c] = At(i).means[b * 3 + c];
+        }
+      }
+    }
+    if (!flagged || flagged * 8 > blocks) continue;
+    local_consumed = n + 1;
+    ++flashes;
+    const uint32_t bx = At(n).h.width / kBlock;
+    REXLOG_INFO(
+        "Lost native flash catch: frames {}-{} ({}), {} block(s), first at block {},{} "
+        "(rgb {:.0f},{:.0f},{:.0f} -> {:.0f},{:.0f},{:.0f})",
+        At(i).h.frame, At(n - 1).h.frame, n - i, flagged, bx ? first % bx : 0, bx ? first / bx : 0,
+        first_base[0], first_base[1], first_base[2], first_away[0], first_away[1], first_away[2]);
+    flight::Request(At(i).h.frame >= 3 ? At(i).h.frame - 3 : 0, At(n).h.frame + 1, At(i).h.frame);
+    dump_pending = true;
+    dump_kind = "flash";
+    dump_from = std::max(i > kPad ? i - kPad : 0, count > kRing ? count - kRing : 0);
+    dump_label = At(i).h.frame;
+    dump_to = std::min(n + kPad, dump_from + kRing - 1);
+    return true;
+  }
+  return false;
 }
 
 void Catcher::Mark(uint64_t frame) {
   if (!count || marks >= kMaxMarks) return;
   ++marks;
   const uint64_t last = count - 1;
-  Dump(count > kRing ? count - kRing : 0, last, "mark", frame);
+  const uint64_t first = count > kRing ? count - kRing : 0;
+  // The draw records of the same frames (flight_recorder.h keeps ~6 s): with them a flash seen and
+  // marked by the player can be traced to its draw offline (tools/flash_report.py --mark).
+  flight::Request(At(first).h.frame, At(last).h.frame, frame);
+  Dump(first, last, "mark", frame);
 }
 
 void Catcher::Dump(uint64_t from, uint64_t to, const char* kind, uint64_t label) {

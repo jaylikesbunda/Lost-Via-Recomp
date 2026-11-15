@@ -16,9 +16,8 @@ REXCVAR_DEFINE_INT32(lost_native_pipeline_threads, 0, "Lost native",
 // timing (stale video frames, panels missing, the title screen seconds late; checked 2026-11-15).
 // First-seen pipelines are instead avoided by compiling them ahead of use.
 REXCVAR_DEFINE_BOOL(lost_native_pipeline_wait, true, "Lost native",
-                    "With --lost_native_async_pipelines, a frame whose draws need pipelines still "
-                    "compiling is not shown and waits for them at its end, up to 0.5 s (false: "
-                    "show it without those draws)");
+                    "With --lost_native_async_pipelines, wait for a missing pipeline before recording "
+                    "its draw, preserving offscreen targets too (false: skip that draw)");
 REXCVAR_DEFINE_BOOL(lost_native_pipeline_cache, true, "Lost native",
                     "Keep the shaders and pipelines the native renderer creates under "
                     "<cache_root>\\lost-native and compile them at start-up in later runs "
@@ -41,3 +40,7 @@ REXCVAR_DEFINE_BOOL(lost_native_luma_probe, false, "Lost native",
                     "Read back three rows of every front buffer (at 10, 40 and 80 % of its "
                     "height) and log their mean brightness in the frame CSV, to find frames "
                     "drawn partly black");
+
+REXCVAR_DEFINE_BOOL(lost_native_precompile_manifest, true, "Lost native",
+                    "Finish available manifest pipelines during startup before the first frame; "
+                    "moves first-use compilation into loading");
