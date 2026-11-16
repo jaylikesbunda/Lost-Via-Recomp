@@ -2,7 +2,7 @@
 //! tools/build.ps1, with the pack's compiler, CMake and Ninja, and Microsoft's C++ library and
 //! Windows SDK fetched by xwin. Nothing else is needed on the player's PC.
 
-use super::{codecheck, emit_progress, emit_step, log, run_streamed_env};
+use super::{codecheck, emit_progress, emit_step, log, run_streamed_env, Sink};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -41,6 +41,11 @@ pub fn find_pack(app: &AppHandle, repo: &Path) -> Option<Pack> {
         candidates.push(r.join("resources").join("pack"));
     }
     candidates.push(repo.join("launcher/src-tauri/resources/pack"));
+    find_pack_in(candidates)
+}
+
+/// The first valid pack among `candidates`.
+pub fn find_pack_in(candidates: impl IntoIterator<Item = PathBuf>) -> Option<Pack> {
     candidates.into_iter().find(|c| Pack::valid(c)).map(|root| Pack { root })
 }
 
@@ -99,7 +104,7 @@ fn jobs() -> String {
     n.saturating_sub(2).max(1).to_string()
 }
 
-fn run(app: &AppHandle, program: &Path, args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<(), String> {
+fn run(app: &Sink, program: &Path, args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<(), String> {
     match run_streamed_env(app, &program.display().to_string(), args, cwd, env) {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("{} failed. Open the log for details.", program.file_name().unwrap_or_default().to_string_lossy())),
@@ -107,7 +112,7 @@ fn run(app: &AppHandle, program: &Path, args: &[String], cwd: &Path, env: &[(Str
     }
 }
 
-fn step<T>(app: &AppHandle, id: &'static str, label: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+fn step<T>(app: &Sink, id: &'static str, label: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     emit_step(app, "build", id, "running", format!("{label}..."));
     log(app, format!("== {label} =="));
     match f() {
@@ -123,7 +128,7 @@ fn step<T>(app: &AppHandle, id: &'static str, label: &str, f: impl FnOnce() -> R
     }
 }
 
-fn fetch_msvc(app: &AppHandle, pack: &Pack, msvc: &Path) -> Result<(), String> {
+fn fetch_msvc(app: &Sink, pack: &Pack, msvc: &Path) -> Result<(), String> {
     if msvc_ready(msvc) {
         log(app, format!("Microsoft libraries already in {}", msvc.display()));
         return Ok(());
@@ -158,7 +163,7 @@ fn fetch_msvc(app: &AppHandle, pack: &Pack, msvc: &Path) -> Result<(), String> {
 }
 
 /// The code generator's output and the files it rewrites that must keep their contents.
-fn regenerate_patched(app: &AppHandle, pack: &Pack, port: &Path, env: &[(String, String)]) -> Result<(), String> {
+fn regenerate_patched(app: &Sink, pack: &Pack, port: &Path, env: &[(String, String)]) -> Result<(), String> {
     let glue = port.join("generated/rexglue.cmake");
     let manifest = port.join("lost_manifest.toml");
     let keep: Vec<(PathBuf, Option<Vec<u8>>)> = [glue, manifest.clone()].into_iter().map(|p| { let b = fs::read(&p).ok(); (p, b) }).collect();
@@ -174,7 +179,7 @@ fn regenerate_patched(app: &AppHandle, pack: &Pack, port: &Path, env: &[(String,
     result
 }
 
-fn hazards(app: &AppHandle, generated: &Path) -> Result<bool, String> {
+fn hazards(app: &Sink, generated: &Path) -> Result<bool, String> {
     let found = codecheck::check(generated)?;
     for (m, n) in &found {
         log(app, format!("{n:6} {m}"));
@@ -182,17 +187,13 @@ fn hazards(app: &AppHandle, generated: &Path) -> Result<bool, String> {
     Ok(!found.is_empty())
 }
 
-pub fn build(app: &AppHandle, repo: &Path, pack: &Pack) -> bool {
-    let Some(msvc) = msvc_dir(app) else {
-        emit_step(app, "build", "msvc", "failed", "No folder for the Microsoft libraries.");
-        return false;
-    };
+pub fn build(app: &Sink, repo: &Path, pack: &Pack, msvc: &Path) -> bool {
     let port = repo.join("port");
     let bdir = build_dir(repo);
-    let env = env(pack, &msvc);
+    let env = env(pack, msvc);
     let cmake = pack.p("cmake/bin/cmake.exe");
 
-    if step(app, "msvc", "Downloading Microsoft libraries", || fetch_msvc(app, pack, &msvc)).is_err() {
+    if step(app, "msvc", "Downloading Microsoft libraries", || fetch_msvc(app, pack, msvc)).is_err() {
         return false;
     }
 

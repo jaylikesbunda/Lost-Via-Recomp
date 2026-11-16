@@ -12,7 +12,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, mpsc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -89,8 +89,40 @@ struct Progress {
     text: String,
 }
 
-fn emit_progress(app: &AppHandle, percent: f64, text: impl Into<String>) {
-    let _ = app.emit("progress", Progress { percent, text: text.into() });
+/// Where a job's log lines, steps and progress go: the launcher's window, or the console when
+/// RecompLauncher runs the setup step (--prepare).
+#[derive(Clone)]
+pub enum Sink {
+    App(AppHandle),
+    Console(Arc<Console>),
+}
+
+/// --prepare output: "progress <0..1> <text>" lines on stdout, everything else in a log file.
+pub struct Console {
+    file: Mutex<Option<fs::File>>,
+    /// The running step's share of the whole setup (start, length) and the last value printed.
+    stage: Mutex<(f64, f64, i64)>,
+}
+
+impl Console {
+    fn print(&self, fraction: f64, text: &str) {
+        let mut st = self.stage.lock().unwrap();
+        let value = (st.0 + st.1 * fraction.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let milli = (value * 1000.0) as i64;
+        if milli != st.2 {
+            st.2 = milli;
+            println!("progress {value:.3} {text}");
+        }
+    }
+}
+
+fn emit_progress(sink: &Sink, percent: f64, text: impl Into<String>) {
+    match sink {
+        Sink::App(app) => {
+            let _ = app.emit("progress", Progress { percent, text: text.into() });
+        }
+        Sink::Console(c) => c.print(percent / 100.0, &text.into()),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -169,25 +201,26 @@ fn unpack_bundled_source(app: &tauri::App) -> Option<PathBuf> {
         return None;
     }
     let dest = app.path().app_local_data_dir().ok()?.join("source");
-    let marker = dest.join(".launcher-version");
-    let version = app.package_info().version.to_string();
-    if fs::read_to_string(&marker).ok().as_deref() == Some(version.as_str()) && is_repo(&dest) {
-        return Some(dest);
-    }
-    let unpack = || -> Result<(), String> {
-        fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-        let file = fs::File::open(&zip_path).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        archive.extract(&dest).map_err(|e| e.to_string())?;
-        fs::write(&marker, &version).map_err(|e| e.to_string())
-    };
-    match unpack() {
+    match unpack_source(&zip_path, &dest, &app.package_info().version.to_string()) {
         Ok(()) => Some(dest),
         Err(e) => {
             eprintln!("could not unpack the bundled source: {e}");
             None
         }
     }
+}
+
+/// Unpacks source.zip into `dest` unless this launcher version already did.
+fn unpack_source(zip_path: &Path, dest: &Path, version: &str) -> Result<(), String> {
+    let marker = dest.join(".launcher-version");
+    if fs::read_to_string(&marker).ok().as_deref() == Some(version) && is_repo(dest) {
+        return Ok(());
+    }
+    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let file = fs::File::open(zip_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    archive.extract(dest).map_err(|e| e.to_string())?;
+    fs::write(&marker, version).map_err(|e| e.to_string())
 }
 
 fn unix_stamp() -> u64 {
@@ -343,8 +376,17 @@ fn write_settings(path: &Path, s: &Settings) -> Result<(), String> {
 // ---------- logging and events ----------
 
 /// Keeps the in-memory log, the task's log file and the page stream in step.
-fn log(app: &AppHandle, line: impl Into<String>) {
+fn log(sink: &Sink, line: impl Into<String>) {
     let line: String = line.into();
+    let app = match sink {
+        Sink::App(app) => app,
+        Sink::Console(c) => {
+            if let Some(f) = c.file.lock().unwrap().as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+            return;
+        }
+    };
     let st = app.state::<AppState>();
     {
         let mut buf = st.log_buf.lock().unwrap();
@@ -359,8 +401,32 @@ fn log(app: &AppHandle, line: impl Into<String>) {
     let _ = st.log_tx.lock().unwrap().send(line);
 }
 
-fn emit_step(app: &AppHandle, task: &'static str, step: &'static str, state: &'static str, message: impl Into<String>) {
-    let _ = app.emit("step", StepEvent { task, step, state, message: message.into() });
+/// Each step's share of the --prepare progress.
+fn prepare_stage(step: &str) -> (f64, f64) {
+    match step {
+        "extract" => (0.0, 0.1),
+        "msvc" => (0.1, 0.15),
+        "configure" => (0.25, 0.1),
+        _ => (0.35, 0.65),
+    }
+}
+
+fn emit_step(sink: &Sink, task: &'static str, step: &'static str, state: &'static str, message: impl Into<String>) {
+    let message = message.into();
+    match sink {
+        Sink::App(app) => {
+            let _ = app.emit("step", StepEvent { task, step, state, message });
+        }
+        Sink::Console(c) => match state {
+            "running" => {
+                let (start, len) = prepare_stage(step);
+                *c.stage.lock().unwrap() = (start, len, -1);
+                c.print(0.0, message.trim_end_matches('.'));
+            }
+            "failed" => eprintln!("{message}"),
+            _ => {}
+        },
+    }
 }
 
 fn begin_task_log(app: &AppHandle, task: &str) {
@@ -371,7 +437,7 @@ fn begin_task_log(app: &AppHandle, task: &str) {
     st.log_buf.lock().unwrap().clear();
 }
 
-fn pump(app: AppHandle, reader: impl Read + Send + 'static) -> JoinHandle<()> {
+fn pump(app: Sink, reader: impl Read + Send + 'static) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(reader).split(b'\n').flatten() {
             let text = String::from_utf8_lossy(&line).trim_end_matches('\r').to_string();
@@ -403,12 +469,12 @@ fn pump(app: AppHandle, reader: impl Read + Send + 'static) -> JoinHandle<()> {
 }
 
 /// Runs a program in `cwd`, streaming stdout and stderr into the log. Returns whether it exited successfully.
-fn run_streamed(app: &AppHandle, program: &str, args: &[String], cwd: &Path) -> Result<bool, String> {
+fn run_streamed(app: &Sink, program: &str, args: &[String], cwd: &Path) -> Result<bool, String> {
     run_streamed_env(app, program, args, cwd, &[])
 }
 
 /// run_streamed with environment changes: an empty value removes the variable.
-fn run_streamed_env(app: &AppHandle, program: &str, args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<bool, String> {
+fn run_streamed_env(app: &Sink, program: &str, args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<bool, String> {
     log(app, format!("> {program} {}", args.join(" ")));
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -452,7 +518,7 @@ fn count_files(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn copy_tree(app: &AppHandle, src: &Path, dst: &Path) -> Result<usize, String> {
+fn copy_tree(app: &Sink, src: &Path, dst: &Path) -> Result<usize, String> {
     let total = count_files(src).max(1);
     let mut count = 0usize;
     let mut stack = vec![src.to_path_buf()];
@@ -481,7 +547,7 @@ fn copy_tree(app: &AppHandle, src: &Path, dst: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
-fn extract_job(app: &AppHandle, repo: &Path, source: &Path, folder: bool) -> bool {
+fn extract_job(app: &Sink, repo: &Path, source: &Path, folder: bool) -> bool {
     let assets = repo.join(ASSETS_REL);
     emit_step(app, "extract", "extract", "running", if folder { "Copying game files..." } else { "Extracting disc..." });
     let result: Result<(), String> = if folder {
@@ -530,14 +596,19 @@ const BUILD_STAGES: [(&str, &str, &str); 3] = [
     ("compile", "Compile game", "tools/build.ps1"),
 ];
 
-fn build_job(app: &AppHandle, repo: &Path) -> bool {
-    if let Some(pack) = builder::find_pack(app, repo) {
+fn build_job(handle: &AppHandle, repo: &Path) -> bool {
+    let app = &Sink::App(handle.clone());
+    if let Some(pack) = builder::find_pack(handle, repo) {
         if game_check(repo).0 != "ok" {
             emit_step(app, "build", "msvc", "failed", "Game files are missing or not the supported version.");
             return false;
         }
         log(app, format!("Build pack: {}", pack.root.display()));
-        return builder::build(app, repo, &pack);
+        let Some(msvc) = builder::msvc_dir(handle) else {
+            emit_step(app, "build", "msvc", "failed", "No folder for the Microsoft libraries.");
+            return false;
+        };
+        return builder::build(app, repo, &pack, &msvc);
     }
     // No build pack (a development checkout): the scripts, with the tools installed on this PC.
     let missing: Vec<String> = prereqs().into_iter().filter(|p| !p.ok).map(|p| p.name).collect();
@@ -657,7 +728,7 @@ fn start_extract(app: AppHandle, path: String, folder: bool) -> Result<(), Strin
     } else if !source.is_file() {
         return Err("That disc image does not exist.".into());
     }
-    start_task(&app, "extract", move |app| extract_job(&app, &repo, &source, folder))
+    start_task(&app, "extract", move |app| extract_job(&Sink::App(app), &repo, &source, folder))
 }
 
 #[tauri::command]
@@ -723,10 +794,76 @@ fn open_log_dir(app: AppHandle) -> Result<(), String> {
     Command::new("explorer").arg(&dir).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Test hooks: `--extract <iso> <out>` and `--check-generated <dir>` run without the window.
+/// RecompLauncher's setup step (recomplauncher.json "prepare"), with no window:
+///   lost-launcher.exe --prepare --game <disc image or folder> [--dir <folder>] [--accept-msvc-license]
+/// Unpacks the bundled source into <folder>\source (default: the launcher's folder), takes the
+/// game files from the player's copy and builds lost.exe there. Prints "progress <0..1> <text>"
+/// lines; the full log goes to <folder>\logs. Exit codes: 0 done, 2 bad arguments or files,
+/// 3 not the supported game, 4 Microsoft's license not accepted, 5 build failed.
+fn prepare(args: &[String]) -> i32 {
+    let mut game: Option<PathBuf> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut license = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--game" => game = it.next().map(PathBuf::from),
+            "--dir" => dir = it.next().map(PathBuf::from),
+            "--accept-msvc-license" => license = true,
+            other => {
+                eprintln!("Unknown option {other}");
+                return 2;
+            }
+        }
+    }
+    let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+        return 2;
+    };
+    let dir = dir.unwrap_or_else(|| exe_dir.clone());
+    let Some(game) = game.filter(|g| g.exists()) else {
+        eprintln!("Pass the disc image or game folder with --game.");
+        return 2;
+    };
+    let logs = dir.join("logs");
+    let _ = fs::create_dir_all(&logs);
+    let sink = Sink::Console(Arc::new(Console {
+        file: Mutex::new(fs::File::create(logs.join(format!("prepare-{}.log", unix_stamp()))).ok()),
+        stage: Mutex::new((0.0, 0.1, -1)),
+    }));
+
+    let msvc = std::env::var("LOST_MSVC_DIR").map(PathBuf::from).unwrap_or_else(|_| dir.join("msvc"));
+    if !license && !builder::msvc_ready(&msvc) {
+        eprintln!("Building needs Microsoft's C++ library and Windows SDK. Tick the option that accepts their license.");
+        return 4;
+    }
+    let repo = dir.join("source");
+    if let Err(e) = unpack_source(&exe_dir.join("resources/source.zip"), &repo, env!("CARGO_PKG_VERSION")) {
+        log(&sink, format!("ERROR: {e}"));
+        eprintln!("Could not unpack the game's source: {e}");
+        return 2;
+    }
+    if !extract_job(&sink, &repo, &game, game.is_dir()) {
+        return 3;
+    }
+    let candidates = std::env::var("LOST_BUILD_PACK").ok().map(PathBuf::from).into_iter().chain([exe_dir.join("resources/pack")]);
+    let Some(pack) = builder::find_pack_in(candidates) else {
+        eprintln!("The build tools (resources\\pack) are missing from this release.");
+        return 2;
+    };
+    log(&sink, format!("Build pack: {}", pack.root.display()));
+    if !builder::build(&sink, &repo, &pack, &msvc) {
+        return 5;
+    }
+    println!("progress 1 Ready");
+    0
+}
+
+/// `--prepare` (above), and the test hooks `--extract <iso> <out>` and `--check-generated <dir>`,
+/// all without the window.
 fn cli() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--prepare") => Some(prepare(&args[2..])),
         Some("--extract") if args.len() == 4 => {
             let mut last = -1i64;
             let r = xdvdfs::extract(Path::new(&args[2]), Path::new(&args[3]), |done, total, file| {

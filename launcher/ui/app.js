@@ -137,8 +137,8 @@
       const ok = await ask(
         "Building the game needs Microsoft's C++ library and Windows SDK. They are downloaded once " +
         "from Microsoft (about 700 MB) and used only to build the game on this PC.\n\n" +
-        "By continuing you accept Microsoft's license terms for the Visual Studio Build Tools " +
-        "(visualstudio.microsoft.com/license-terms).",
+        "By continuing you accept Microsoft's license terms for the Build Tools for Visual Studio 2022 " +
+        "(visualstudio.microsoft.com/license-terms/vs2022-ga-diagnosticbuildtools).",
         { title: "Microsoft license", kind: "info", okLabel: "Accept and build", cancelLabel: "Cancel" });
       if (!ok) return;
       try {
