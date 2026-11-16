@@ -56,9 +56,14 @@ $msp = Join-Path $sdk 'thirdparty\libmspack'
 foreach ($line in (git -C $msp ls-files -s)) {
   if ($line -match '^120000 \S+ \d+\t(.+)$') {
     $rel = $Matches[1]; $link = Join-Path $msp $rel
-    if ((Get-Item $link).Length -lt 256) {
-      $target = Join-Path (Split-Path $link -Parent) ((Get-Content $link -Raw).Trim())
-      if (Test-Path $target -PathType Leaf) { Copy-Item $target $link -Force; "[link ] $rel" }
+    # Where git made real symlinks (the CI runner can) there is nothing to replace.
+    $item = Get-Item -LiteralPath $link -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+    if ($item.Length -lt 256) {
+      $text = ([IO.File]::ReadAllText($link)).Trim()
+      if (!$text -or $text.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0) { continue }
+      $target = Join-Path (Split-Path $link -Parent) $text
+      if (Test-Path -LiteralPath $target -PathType Leaf) { Copy-Item -LiteralPath $target $link -Force; "[link ] $rel" }
     }
   }
 }
