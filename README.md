@@ -4,6 +4,7 @@
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/Licence-MIT-555?style=for-the-badge" alt="Licence: MIT"></a>
   </p>
+  <a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 </div>
 
 > [!IMPORTANT]

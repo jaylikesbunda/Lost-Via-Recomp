@@ -57,10 +57,17 @@ jobs:
           if ($setups.Count -ne 1) { throw 'expected exactly one installer' }
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $setups[0].FullName "dist/LostLauncher-${{ steps.version.outputs.value }}-windows-x64-setup.exe"
+          # The same launcher and build pack as a zip for RecompLauncher, with recomplauncher.json
+          # at the top next to the program: its setup step runs lost-launcher.exe --prepare.
+          $z = New-Item -ItemType Directory -Force zip-root
+          Copy-Item launcher/src-tauri/target/release/lost-launcher.exe, recomplauncher.json $z
+          Copy-Item -Recurse launcher/src-tauri/resources (Join-Path $z resources)
+          7z a -tzip -mx=7 "dist/LostViaDomus-v${{ steps.version.outputs.value }}-Windows-x64.zip" ./zip-root/*
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist -File | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content dist/SHA256SUMS.txt -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
-          name: lost-launcher-installer
+          name: lost-launcher-release
           path: dist/*
           if-no-files-found: error
       - name: Publish tagged release

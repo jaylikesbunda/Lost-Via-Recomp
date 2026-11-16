@@ -1,0 +1,132 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Lost: Via Domus",
+  "game": {
+    "kind": "iso_or_folder",
+    "label": "Your copy of Lost: Via Domus for Xbox 360 (USA, Europe): its disc image (.iso), or its folder with default.xex.",
+    "check": { "file": "default.xex", "xdvdfs": "default.xex" },
+    "dumps": [
+      { "name": "Lost - Via Domus (USA, Europe) (En,Fr,De,Es,It)", "size": 7835492352, "crc32": "0daa92f4" }
+    ]
+  },
+  "prepare": {
+    "program": ["lost-launcher.exe"],
+    "args": ["--prepare", "--game", "{game}", "--dir", "{install}"],
+    "label": "Builds the game from your disc on this PC. The first time takes a few minutes or more.",
+    "timeout": 7200,
+    "version": "1",
+    "done": ["{install}/source/port/out/build/win-amd64-relwithdebinfo/lost.exe"],
+    "options": [
+      {
+        "id": "msvc",
+        "label": "Download Microsoft's C++ library and Windows SDK",
+        "note": "Needed to build the game. About 700 MB from Microsoft, once.",
+        "args": ["--accept-msvc-license"],
+        "os": ["windows"],
+        "license": {
+          "name": "Microsoft Build Tools for Visual Studio 2022 license",
+          "url": "https://visualstudio.microsoft.com/license-terms/vs2022-ga-diagnosticbuildtools/"
+        }
+      }
+    ]
+  },
+  "start": {
+    "program": ["source/port/out/build/win-amd64-relwithdebinfo/lost.exe"],
+    "args": ["--log_file={install}/logs/lost.log"]
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "toml",
+      "file": [{ "path": "{install}/source/port/out/build/win-amd64-relwithdebinfo/lost.toml" }],
+      "new": {
+        "lost_target_fps": "60",
+        "lost_native_primary": "true"
+      }
+    }
+  ],
+  "folders": {
+    "saves": [{ "path": "{documents}/lost" }],
+    "logs": [{ "path": "{install}/logs" }]
+  },
+  "settings": [
+    {
+      "id": "window", "label": "Window",
+      "help": "Fullscreen fills your screen. Windowed lets you keep other apps in view.",
+      "choices": [
+        { "label": "Fullscreen", "set": { "fullscreen": "true" } },
+        { "label": "Windowed", "set": { "fullscreen": "false" } }
+      ],
+      "defaults": { "fullscreen": "true" }
+    },
+    {
+      "id": "frame_rate", "label": "Frame rate",
+      "help": "The console plays at 30. Higher rates are smoother and keep the game's speed right.",
+      "choices": [
+        { "label": "30 (console)", "set": { "lost_target_fps": "30" } },
+        { "label": "60", "set": { "lost_target_fps": "60" } },
+        { "label": "120", "set": { "lost_target_fps": "120" } },
+        { "label": "144", "set": { "lost_target_fps": "144" } },
+        { "label": "Uncapped", "set": { "lost_target_fps": "0" } }
+      ],
+      "defaults": { "lost_target_fps": "30" }
+    },
+    {
+      "id": "resolution", "label": "Resolution",
+      "help": "What the game draws at. 720p is the console's own. 1440p is sharp on a 1080p screen. 4K needs a fast graphics card.",
+      "choices": [
+        { "label": "720p", "set": { "resolution_scale": "1" } },
+        { "label": "1440p", "set": { "resolution_scale": "2" } },
+        { "label": "4K", "set": { "resolution_scale": "3" } }
+      ],
+      "defaults": { "resolution_scale": "1" }
+    },
+    {
+      "id": "upscaling", "label": "Upscaling",
+      "help": "How the picture is fitted to your screen. CAS and FSR keep it sharper, most of all at 720p.",
+      "choices": [
+        { "label": "Off", "set": { "present_effect": "\"bilinear\"" } },
+        { "label": "CAS", "set": { "present_effect": "\"cas\"" } },
+        { "label": "FSR", "set": { "present_effect": "\"fsr\"" } }
+      ],
+      "defaults": { "present_effect": "\"bilinear\"" }
+    },
+    {
+      "id": "antialiasing", "label": "Anti-aliasing",
+      "help": "Smooths jagged edges on the final picture.",
+      "choices": [
+        { "label": "Off", "set": { "swap_post_effect": "\"none\"" } },
+        { "label": "FXAA", "set": { "swap_post_effect": "\"fxaa\"" } },
+        { "label": "FXAA extreme", "set": { "swap_post_effect": "\"fxaa_extreme\"" } }
+      ],
+      "defaults": { "swap_post_effect": "\"none\"" }
+    },
+    {
+      "id": "filtering", "label": "Texture filtering",
+      "help": "Keeps the ground and walls sharp at shallow angles. Costs next to nothing.",
+      "choices": [
+        { "label": "Game's own", "set": { "anisotropic_override": "-1" } },
+        { "label": "2x", "set": { "anisotropic_override": "2" } },
+        { "label": "4x", "set": { "anisotropic_override": "3" } },
+        { "label": "8x", "set": { "anisotropic_override": "4" } },
+        { "label": "16x", "set": { "anisotropic_override": "5" } }
+      ],
+      "defaults": { "anisotropic_override": "3" }
+    },
+    {
+      "id": "renderer", "label": "Renderer",
+      "help": "The native Direct3D 12 renderer runs faster. It is newer, so switch to Standard if something looks wrong.",
+      "choices": [
+        { "label": "Native", "set": { "lost_native_primary": "true" } },
+        { "label": "Standard", "set": { "lost_native_primary": "false" } }
+      ],
+      "defaults": { "lost_native_primary": "false" }
+    }
+  ],
+  "actions": [
+    { "id": "saves", "label": "Open saves", "open": "saves" },
+    { "id": "logs", "label": "Open logs", "open": "logs" },
+    { "id": "cache", "label": "Clear shader cache", "help": "Shaders are built again as you play. Try this if the picture looks broken after an update.", "clear": "saves/cache" }
+  ]
+}
