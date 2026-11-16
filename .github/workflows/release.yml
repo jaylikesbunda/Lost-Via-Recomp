@@ -9,8 +9,9 @@ jobs:
   installer:
     permissions:
       contents: write
-    runs-on: windows-latest
-    timeout-minutes: 60
+    # Visual Studio 2022 builds the patched SDK here, so players don't need it.
+    runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,6 +26,15 @@ jobs:
           $version = (Get-Content launcher/src-tauri/tauri.conf.json | ConvertFrom-Json).version
           if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$version") { throw "tag must match launcher version v$version" }
           "value=$version" >> $env:GITHUB_OUTPUT
+      - name: Set up the toolchain and SDK source
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/setup.ps1
+      - name: Patch and build the SDK
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/patch-sdk.ps1
+      - name: Assemble the build pack
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/make_build_pack.ps1
       - name: Pack project source
         shell: pwsh
         run: |

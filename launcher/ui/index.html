@@ -20,7 +20,8 @@
   <button class="link" id="altBtn" hidden></button>
 
   <div class="progress" id="progress" hidden>
-    <div class="bar"><i></i></div>
+    <div class="bar" id="bar"><i></i></div>
+    <p class="pct" id="pct"></p>
   </div>
   <button class="link" id="logToggle" hidden>Show log</button>
 
@@ -37,6 +38,7 @@
   <div class="row">
     <span>Frame rate</span>
     <div class="seg" id="fpsSeg">
+      <button data-fps="auto" id="fpsAuto">Auto</button>
       <button data-fps="30">30</button>
       <button data-fps="60">60</button>
       <button data-fps="120">120</button>
@@ -45,8 +47,26 @@
     </div>
   </div>
 
+  <div class="row">
+    <span>Display</span>
+    <div class="seg" id="modeSeg">
+      <button data-mode="full">Fullscreen</button>
+      <button data-mode="window">Windowed</button>
+    </div>
+  </div>
+
+  <div class="row">
+    <span>Resolution</span>
+    <div class="seg" id="resSeg">
+      <button data-res="">720p</button>
+      <button data-res="1080p">1080p</button>
+      <button data-res="1440p">1440p</button>
+      <button data-res="4k">4K</button>
+    </div>
+  </div>
+
   <label class="row">
-    <span>Native renderer <small>Experimental</small></span>
+    <span>Native renderer <small>Direct3D 12</small></span>
     <input type="checkbox" id="nativeToggle"><i class="toggle"></i>
   </label>
 

@@ -6,7 +6,14 @@
   const openDialog = window.__TAURI__.dialog.open;
   const $ = (id) => document.getElementById(id);
   const LOG_CAP = 4000;
-  const STEP_TEXT = { setup: "Setting up tools", patch: "Patching SDK", compile: "Compiling the game" };
+  const STEP_TEXT = {
+    msvc: "Downloading Microsoft libraries (once)",
+    configure: "Preparing the build",
+    compile: "Compiling the game",
+    setup: "Setting up tools",
+    patch: "Patching SDK",
+  };
+  const ask = window.__TAURI__.dialog.ask;
 
   let status = null;
   let busy = null;      // "extract" | "build" | null
@@ -93,6 +100,7 @@
   // ---------- actions ----------
 
   async function run(task, cmd, args) {
+    setProgress(null);
     error = "";
     logLines = [];
     renderLog();
@@ -122,7 +130,26 @@
     if (path) run("extract", "start_extract", { path: String(path), folder: true });
   }
 
-  function startBuild() {
+  async function startBuild() {
+    // The first build downloads Microsoft's C++ library and Windows SDK, which come with
+    // Microsoft's license terms (the Visual Studio Build Tools license).
+    if (status && status.needs_license) {
+      const ok = await ask(
+        "Building the game needs Microsoft's C++ library and Windows SDK. They are downloaded once " +
+        "from Microsoft (about 700 MB) and used only to build the game on this PC.\n\n" +
+        "By continuing you accept Microsoft's license terms for the Visual Studio Build Tools " +
+        "(visualstudio.microsoft.com/license-terms).",
+        { title: "Microsoft license", kind: "info", okLabel: "Accept and build", cancelLabel: "Cancel" });
+      if (!ok) return;
+      try {
+        status.settings = await invoke("save_settings", { settings: { ...status.settings, msvc_license: true } });
+        status.needs_license = false;
+      } catch (e) {
+        error = String(e);
+        render();
+        return;
+      }
+    }
     run("build", "start_build", {});
   }
 
@@ -157,7 +184,13 @@
   function renderSettings() {
     if (!status) return;
     const s = status.settings;
-    document.querySelectorAll("#fpsSeg button").forEach((b) => b.classList.toggle("on", Number(b.dataset.fps) === s.fps));
+    document.querySelectorAll("#fpsSeg button").forEach((b) =>
+      b.classList.toggle("on", b.dataset.fps === "auto" ? s.fps == null : Number(b.dataset.fps) === s.fps));
+    $("fpsAuto").textContent = "Auto (" + status.auto_fps + ")";
+    $("fpsAuto").title = status.refresh_hz ? "Your monitor runs at " + status.refresh_hz + " Hz" : "";
+    document.querySelectorAll("#modeSeg button").forEach((b) =>
+      b.classList.toggle("on", (b.dataset.mode === "full") === !!s.fullscreen));
+    document.querySelectorAll("#resSeg button").forEach((b) => b.classList.toggle("on", b.dataset.res === (s.resolution || "")));
     $("nativeToggle").checked = !!s.native_primary;
     $("repoPath").textContent = status.repo_root || "Not found";
   }
@@ -182,7 +215,12 @@
   $("settingsBtn").addEventListener("click", () => showSettings(true));
   $("backBtn").addEventListener("click", () => showSettings(false));
   document.querySelectorAll("#fpsSeg button").forEach((b) =>
-    b.addEventListener("click", () => save({ ...status.settings, fps: Number(b.dataset.fps) })));
+    b.addEventListener("click", () =>
+      save({ ...status.settings, fps: b.dataset.fps === "auto" ? null : Number(b.dataset.fps) })));
+  document.querySelectorAll("#modeSeg button").forEach((b) =>
+    b.addEventListener("click", () => save({ ...status.settings, fullscreen: b.dataset.mode === "full" })));
+  document.querySelectorAll("#resSeg button").forEach((b) =>
+    b.addEventListener("click", () => save({ ...status.settings, resolution: b.dataset.res })));
   $("nativeToggle").addEventListener("change", (e) => save({ ...status.settings, native_primary: e.target.checked }));
   $("repoPick").addEventListener("click", async () => {
     const path = await openDialog({ directory: true, multiple: false, title: "Choose the Lost: Via Domus folder" });
@@ -192,9 +230,19 @@
 
   // ---------- backend events ----------
 
+  function setProgress(percent, text) {
+    const known = percent != null;
+    $("bar").classList.toggle("known", known);
+    $("bar").querySelector("i").style.width = known ? Math.max(1, Math.min(100, percent)).toFixed(1) + "%" : "";
+    $("pct").textContent = known ? Math.floor(percent) + "%  " + (text || "") : "";
+  }
+
+  listen("progress", (e) => setProgress(e.payload.percent, e.payload.text));
+
   listen("step", (e) => {
     const p = e.payload;
     if (p.state === "running") {
+      setProgress(null);
       stepText = p.task === "extract" ? p.message : (STEP_TEXT[p.step] || p.message);
       stepText = stepText.replace(/\.+$/, "") + "...";
     } else if (p.state === "failed") {

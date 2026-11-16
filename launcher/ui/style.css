@@ -37,6 +37,8 @@ h1 span { display: block; margin-top: 14px; font-size: 12px; font-weight: 500; l
 .bar { height: 2px; background: var(--line); overflow: hidden; position: relative; }
 .bar i { position: absolute; top: 0; height: 100%; width: 30%; background: var(--accent); animation: slide 1.4s ease-in-out infinite; }
 @keyframes slide { from { left: -30%; } to { left: 100%; } }
+.bar.known i { animation: none; left: 0; transition: width .2s; }
+.pct { margin: 8px 0 0; min-height: 18px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .missing { list-style: none; margin: 24px 0 0; padding: 0; color: var(--muted); font-size: 13px; }
 .missing li::before { content: "Missing: "; color: var(--bad); }

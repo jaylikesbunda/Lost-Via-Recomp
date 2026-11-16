@@ -1,5 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod builder;
+mod codecheck;
+mod xdvdfs;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,7 +24,7 @@ const XEX_REL: &str = "port/assets/default.xex";
 const ASSETS_REL: &str = "port/assets";
 const EXE_REL: &str = "port/out/build/win-amd64-relwithdebinfo/lost.exe";
 const FPS_CHOICES: [u32; 5] = [0, 30, 60, 120, 144];
-const DEFAULT_FPS: u32 = 60;
+const RESOLUTIONS: [&str; 4] = ["", "1080p", "1440p", "4k"];
 const LOG_CAP: usize = 4000;
 const NO_REPO: &str = "The repository folder was not found. Set it in Settings.";
 #[cfg(windows)]
@@ -29,17 +33,23 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 struct Settings {
-    /// Target frame rate passed as --lost_target_fps. 0 means uncapped.
-    fps: u32,
-    /// Passes --lost_native_primary (experimental Direct3D 12 renderer).
+    /// Target frame rate passed as --lost_target_fps (0 = uncapped). None: follow the monitor.
+    fps: Option<u32>,
+    /// The native Direct3D 12 renderer (--lost_native_primary).
     native_primary: bool,
+    /// Borderless fullscreen (--fullscreen) or a window (--no-fullscreen).
+    fullscreen: bool,
+    /// --resolution preset; empty is the game's default (720p).
+    resolution: String,
+    /// The player accepted Microsoft's license terms for the C++ library and Windows SDK.
+    msvc_license: bool,
     /// Manual repository folder when the launcher is not inside the repo.
     repo_root: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { fps: DEFAULT_FPS, native_primary: false, repo_root: None }
+        Settings { fps: None, native_primary: true, fullscreen: true, resolution: String::new(), msvc_license: false, repo_root: None }
     }
 }
 
@@ -59,6 +69,10 @@ struct Status {
     prereqs: Vec<Prereq>,
     settings: Settings,
     log_dir: String,
+    refresh_hz: u32,
+    auto_fps: u32,
+    /// The next build downloads Microsoft's libraries, whose license the player has not accepted.
+    needs_license: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -67,6 +81,16 @@ struct StepEvent {
     step: &'static str,
     state: &'static str,
     message: String,
+}
+
+#[derive(Clone, Serialize)]
+struct Progress {
+    percent: f64,
+    text: String,
+}
+
+fn emit_progress(app: &AppHandle, percent: f64, text: impl Into<String>) {
+    let _ = app.emit("progress", Progress { percent, text: text.into() });
 }
 
 #[derive(Clone, Serialize)]
@@ -268,14 +292,43 @@ fn prereqs() -> Vec<Prereq> {
     ]
 }
 
+fn sanitize(s: &mut Settings) {
+    if s.fps.is_some_and(|f| !FPS_CHOICES.contains(&f)) {
+        s.fps = None;
+    }
+    if !RESOLUTIONS.contains(&s.resolution.as_str()) {
+        s.resolution.clear();
+    }
+}
+
+/// The primary monitor's refresh rate in Hz (0 if unknown).
+fn refresh_hz() -> u32 {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
+        let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) != 0 && dm.dmDisplayFrequency > 1 {
+            return dm.dmDisplayFrequency;
+        }
+    }
+    0
+}
+
+/// The highest frame rate choice the monitor can show (60 if the refresh rate is unknown).
+fn auto_fps(hz: u32) -> u32 {
+    if hz == 0 {
+        return 60;
+    }
+    [144, 120, 60, 30].into_iter().find(|&f| f <= hz + 1).unwrap_or(30)
+}
+
 fn read_settings(path: &Path) -> Settings {
     let mut s: Settings = fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    if !FPS_CHOICES.contains(&s.fps) {
-        s.fps = DEFAULT_FPS;
-    }
+    sanitize(&mut s);
     s
 }
 
@@ -322,6 +375,26 @@ fn pump(app: AppHandle, reader: impl Read + Send + 'static) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(reader).split(b'\n').flatten() {
             let text = String::from_utf8_lossy(&line).trim_end_matches('\r').to_string();
+            // "# progress <done> <total> <file>" from tools/xdvdfs.py extract.
+            if let Some(rest) = text.strip_prefix("# progress ") {
+                let mut it = rest.splitn(3, ' ');
+                let done = it.next().and_then(|v| v.parse::<f64>().ok());
+                let total = it.next().and_then(|v| v.parse::<f64>().ok());
+                if let (Some(done), Some(total)) = (done, total) {
+                    let file = it.next().unwrap_or("").rsplit('/').next().unwrap_or("");
+                    emit_progress(&app, 100.0 * done / total.max(1.0), format!("Extracting {file}"));
+                }
+                continue;
+            }
+            // Ninja's "[n/m] ..." lines while compiling.
+            if let Some((n, m)) = text
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(']'))
+                .and_then(|(nm, _)| nm.split_once('/'))
+                .and_then(|(n, m)| Some((n.parse::<f64>().ok()?, m.parse::<f64>().ok()?)))
+            {
+                emit_progress(&app, 100.0 * n / m.max(1.0), format!("Compiling {n} of {m}"));
+            }
             if !text.trim().is_empty() {
                 log(&app, text);
             }
@@ -331,9 +404,21 @@ fn pump(app: AppHandle, reader: impl Read + Send + 'static) -> JoinHandle<()> {
 
 /// Runs a program in `cwd`, streaming stdout and stderr into the log. Returns whether it exited successfully.
 fn run_streamed(app: &AppHandle, program: &str, args: &[String], cwd: &Path) -> Result<bool, String> {
+    run_streamed_env(app, program, args, cwd, &[])
+}
+
+/// run_streamed with environment changes: an empty value removes the variable.
+fn run_streamed_env(app: &AppHandle, program: &str, args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<bool, String> {
     log(app, format!("> {program} {}", args.join(" ")));
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env {
+        if v.is_empty() {
+            cmd.env_remove(k);
+        } else {
+            cmd.env(k, v);
+        }
+    }
     no_window(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("Could not start {program}: {e}"))?;
     let mut readers = Vec::new();
@@ -353,7 +438,22 @@ fn run_streamed(app: &AppHandle, program: &str, args: &[String], cwd: &Path) -> 
 // ---------- jobs ----------
 
 /// Copies an already-extracted game folder into port/assets, one file at a time.
+fn count_files(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| match e.file_type() {
+                    Ok(t) if t.is_dir() => count_files(&e.path()),
+                    Ok(t) if t.is_file() => 1,
+                    _ => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 fn copy_tree(app: &AppHandle, src: &Path, dst: &Path) -> Result<usize, String> {
+    let total = count_files(src).max(1);
     let mut count = 0usize;
     let mut stack = vec![src.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -370,6 +470,8 @@ fn copy_tree(app: &AppHandle, src: &Path, dst: &Path) -> Result<usize, String> {
                 let to = target_dir.join(entry.file_name());
                 fs::copy(&from, &to).map_err(|e| format!("Could not copy {}: {e}", from.display()))?;
                 count += 1;
+                emit_progress(app, 100.0 * count as f64 / total as f64,
+                              format!("Copying {}", entry.file_name().to_string_lossy()));
                 if count % 200 == 0 {
                     log(app, format!("Copied {count} files..."));
                 }
@@ -394,23 +496,16 @@ fn extract_job(app: &AppHandle, repo: &Path, source: &Path, folder: bool) -> boo
             copy_tree(app, source, &assets).map(|n| log(app, format!("Copied {n} files.")))
         }
     } else {
-        match find_python() {
-            None => Err("Python 3 was not found. Install it, then try again.".into()),
-            Some((program, mut args, _)) => {
-                args.extend([
-                    "-I".to_string(),
-                    "tools/xdvdfs.py".to_string(),
-                    "extract".to_string(),
-                    source.display().to_string(),
-                    assets.display().to_string(),
-                ]);
-                match run_streamed(app, &program, &args, repo) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err("Extracting the disc failed. Open the Log page for details.".into()),
-                    Err(e) => Err(e),
-                }
+        log(app, format!("Extracting {}", source.display()));
+        let mut last = String::new();
+        xdvdfs::extract(source, &assets, |done, total, file| {
+            emit_progress(app, 100.0 * done as f64 / total as f64, format!("Extracting {}", file.rsplit('/').next().unwrap_or(file)));
+            if file != last {
+                log(app, file.to_string());
+                last = file.to_string();
             }
-        }
+        })
+        .map(|n| log(app, format!("Extracted {n} files.")))
     };
     let result = result.and_then(|_| {
         let (state, detail) = game_check(repo);
@@ -436,6 +531,15 @@ const BUILD_STAGES: [(&str, &str, &str); 3] = [
 ];
 
 fn build_job(app: &AppHandle, repo: &Path) -> bool {
+    if let Some(pack) = builder::find_pack(app, repo) {
+        if game_check(repo).0 != "ok" {
+            emit_step(app, "build", "msvc", "failed", "Game files are missing or not the supported version.");
+            return false;
+        }
+        log(app, format!("Build pack: {}", pack.root.display()));
+        return builder::build(app, repo, &pack);
+    }
+    // No build pack (a development checkout): the scripts, with the tools installed on this PC.
     let missing: Vec<String> = prereqs().into_iter().filter(|p| !p.ok).map(|p| p.name).collect();
     if !missing.is_empty() {
         let msg = format!("Missing: {}. Install them, then try again.", missing.join(", "));
@@ -508,6 +612,10 @@ fn collect_status(app: &AppHandle) -> Status {
         (s, st.log_dir.display().to_string())
     };
     let repo = repo_root(app);
+    let pack = repo.as_ref().is_some_and(|r| builder::find_pack(app, r).is_some());
+    let needs_license = pack
+        && !settings.msvc_license
+        && !builder::msvc_dir(app).is_some_and(|d| builder::msvc_ready(&d));
     let (game_state, game_detail, built) = match &repo {
         Some(r) => {
             let (state, detail) = game_check(r);
@@ -520,9 +628,12 @@ fn collect_status(app: &AppHandle) -> Status {
         game_state,
         game_detail,
         built,
-        prereqs: prereqs(),
+        prereqs: if pack { vec![] } else { prereqs() },
+        needs_license,
         settings,
         log_dir,
+        refresh_hz: refresh_hz(),
+        auto_fps: auto_fps(refresh_hz()),
     }
 }
 
@@ -552,6 +663,9 @@ fn start_extract(app: AppHandle, path: String, folder: bool) -> Result<(), Strin
 #[tauri::command]
 fn start_build(app: AppHandle) -> Result<(), String> {
     let repo = repo_root(&app).ok_or_else(|| NO_REPO.to_string())?;
+    if collect_status(&app).needs_license {
+        return Err("Accept Microsoft's license terms first.".into());
+    }
     start_task(&app, "build", move |app| build_job(&app, &repo))
 }
 
@@ -565,9 +679,14 @@ fn play(app: AppHandle) -> Result<(), String> {
         return Err("The game is not built yet. Run Build first.".into());
     }
     let mut cmd = Command::new(&exe);
-    cmd.current_dir(&port).arg(format!("--lost_target_fps={}", settings.fps));
-    if settings.native_primary {
-        cmd.arg("--lost_native_primary");
+    let fps = settings.fps.unwrap_or_else(|| auto_fps(refresh_hz()));
+    cmd.current_dir(&port).arg(format!("--lost_target_fps={fps}"));
+    // Explicit, so the game finds its files wherever the build put lost.exe.
+    cmd.arg("--game_data_root").arg(repo.join(ASSETS_REL));
+    cmd.arg(if settings.native_primary { "--lost_native_primary" } else { "--no-lost_native_primary" });
+    cmd.arg(if settings.fullscreen { "--fullscreen" } else { "--no-fullscreen" });
+    if !settings.resolution.is_empty() {
+        cmd.arg(format!("--resolution={}", settings.resolution));
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     cmd.spawn().map_err(|e| format!("Could not start the game: {e}"))?;
@@ -577,9 +696,7 @@ fn play(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
     let mut s = settings;
-    if !FPS_CHOICES.contains(&s.fps) {
-        s.fps = DEFAULT_FPS;
-    }
+    sanitize(&mut s);
     s.repo_root = s.repo_root.take().map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
     if let Some(p) = &s.repo_root {
         if !is_repo(Path::new(p)) {
@@ -606,7 +723,42 @@ fn open_log_dir(app: AppHandle) -> Result<(), String> {
     Command::new("explorer").arg(&dir).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Test hooks: `--extract <iso> <out>` and `--check-generated <dir>` run without the window.
+fn cli() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--extract") if args.len() == 4 => {
+            let mut last = -1i64;
+            let r = xdvdfs::extract(Path::new(&args[2]), Path::new(&args[3]), |done, total, file| {
+                let pct = (100 * done / total) as i64;
+                if pct != last {
+                    println!("{pct}% {file}");
+                    last = pct;
+                }
+            });
+            Some(match r {
+                Ok(n) => { println!("extracted {n} files"); 0 }
+                Err(e) => { println!("error: {e}"); 1 }
+            })
+        }
+        Some("--check-generated") if args.len() == 3 => Some(match codecheck::check(Path::new(&args[2])) {
+            Ok(found) => {
+                for (m, n) in &found {
+                    println!("{n:6} {m}");
+                }
+                println!("{} hazard kinds", found.len());
+                i32::from(!found.is_empty())
+            }
+            Err(e) => { println!("error: {e}"); 2 }
+        }),
+        _ => None,
+    }
+}
+
 fn main() {
+    if let Some(code) = cli() {
+        std::process::exit(code);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

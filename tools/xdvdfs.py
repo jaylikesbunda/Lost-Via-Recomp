@@ -63,9 +63,11 @@ def main():
         elif cmd == "extract":
             out = sys.argv[3]
             globs = sys.argv[4:] or ["*"]
-            for p, s, z, d in entries:
-                if d or not any(fnmatch.fnmatch(p.lower(), g.lower()) for g in globs):
-                    continue
+            chosen = [e for e in entries
+                      if not e[3] and any(fnmatch.fnmatch(e[0].lower(), g.lower()) for g in globs)]
+            total = sum(e[2] for e in chosen) or 1
+            done = 0
+            for p, s, z, d in chosen:
                 dst = os.path.join(out, *p.split("/"))
                 if os.path.normpath(dst).startswith(os.path.normpath(out)) is False:
                     raise SystemExit(f"unsafe path {p}")
@@ -77,7 +79,10 @@ def main():
                         chunk = f.read(min(left, 8 << 20))
                         o.write(chunk)
                         left -= len(chunk)
-                print(f"{z:>12}  {p}")
+                        done += len(chunk)
+                        # Machine-readable progress for the launcher: bytes done, bytes total, file.
+                        print(f"# progress {done} {total} {p}", flush=True)
+                print(f"{z:>12}  {p}", flush=True)
 
 
 if __name__ == "__main__":

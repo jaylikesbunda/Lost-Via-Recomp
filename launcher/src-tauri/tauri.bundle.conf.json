@@ -5,7 +5,7 @@
     "shortDescription": "Build and play Lost: Via Domus from your own Xbox 360 disc",
     "licenseFile": "../../LICENSE",
     "targets": ["nsis"],
-    "resources": ["resources/source.zip"],
+    "resources": ["resources/source.zip", "resources/pack/**/*"],
     "windows": {
       "nsis": {
         "installMode": "currentUser",
