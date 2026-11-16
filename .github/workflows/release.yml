@@ -45,11 +45,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: launcher/src-tauri
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version 2.11.1 --locked
       - name: Build installer
         working-directory: launcher/src-tauri
-        run: cargo tauri build --config tauri.bundle.conf.json
+        # The npm package is the same CLI prebuilt, so it isn't compiled on every run.
+        run: npx --yes @tauri-apps/cli@2.11.1 build --config tauri.bundle.conf.json
       - name: Collect installer
         shell: pwsh
         run: |
