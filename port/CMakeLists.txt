@@ -89,6 +89,12 @@ if(WIN32)
         target_link_libraries(lost PRIVATE lost_native lost_shader_xlate)
         target_link_libraries(lost PRIVATE d3d12 dxgi dxguid)
         target_compile_definitions(lost PRIVATE LOST_NATIVE_RENDERER=1)
+        # The recorded pipelines (tools/pipeline_manifest.py: hashes and pipeline state, no shader
+        # code), beside lost.exe so the renderer builds them at start instead of hitching in play.
+        add_custom_target(lost_pipeline_manifest ALL
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/native/pipelines.manifest" "$<TARGET_FILE_DIR:lost>/pipelines.manifest"
+            VERBATIM)
     else()
         message(STATUS "lost: native renderer not built (needs ${LOST_REXGLUE_SDK_SRC})")
     endif()
